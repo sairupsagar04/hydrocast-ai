@@ -6,3 +6,4 @@ python-dotenv
 networkx
 numpy
 pandas
+opencv-python-headless
