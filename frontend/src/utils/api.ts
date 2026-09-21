@@ -1,6 +1,6 @@
 // frontend/src/utils/api.ts
 
-const BACKEND_URL = 'http://localhost:8000';
+const BACKEND_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
 export interface InundatedStreet {
   id: string;
