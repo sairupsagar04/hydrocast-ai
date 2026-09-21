@@ -5,5 +5,11 @@ pydantic
 python-dotenv
 networkx
 numpy
+opencv-python
+torch
+google-genai
 pandas
-opencv-python-headless
+osmnx
+rasterio
+pyswmm
+onnxruntime
