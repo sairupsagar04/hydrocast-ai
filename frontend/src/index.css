@@ -42,3 +42,50 @@ html, body, #root {
   color: #a1a1aa !important;
   text-decoration: none;
 }
+/* frontend/src/index.css */
+
+/* Animated Marching Ants Flow Regimes */
+@keyframes marching-ants-overflow {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -32px; }
+}
+@keyframes marching-ants-moderate {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -24px; }
+}
+@keyframes marching-ants-normal {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -16px; }
+}
+@keyframes marching-ants-oscillating {
+  0% { stroke-dashoffset: -14px; }
+  50% { stroke-dashoffset: 14px; }
+  100% { stroke-dashoffset: -14px; }
+}
+
+path.marching-ants-overflow {
+  stroke-dasharray: 10, 6 !important;
+  animation: marching-ants-overflow 0.55s linear infinite !important;
+}
+path.marching-ants-moderate {
+  stroke-dasharray: 8, 6 !important;
+  animation: marching-ants-moderate 1.1s linear infinite !important;
+}
+path.marching-ants-normal {
+  stroke-dasharray: 8, 6 !important;
+  animation: marching-ants-normal 2.0s linear infinite !important;
+}
+path.marching-ants-blocked {
+  stroke-dasharray: 8, 6 !important;
+  animation: marching-ants-oscillating 0.85s ease-in-out infinite !important;
+}
+
+/* Surcharging Manhole Halo Pulse */
+@keyframes drainage-subtle-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(1); }
+  50% { opacity: 0.75; transform: scale(1.12); }
+}
+.drainage-halo-pulse {
+  animation: drainage-subtle-pulse 2.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  transform-origin: center;
+}
