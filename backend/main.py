@@ -15,6 +15,7 @@ from typing import Optional, List, Dict, Any
 
 from gis.spatial_engine import SpatialEngine
 from ml.inundation_surrogate import FusionNeuralNetwork
+from routing.flood_router import plan_routes
 from services.osm_service import fetch_roads_near_point
 from services.rainfall_service import fetch_rainfall
 
@@ -249,18 +250,36 @@ async def coupled_nowcast(req: DynamicPointRequest):
         pipe["status"] = "surcharged" if (sim_cm >= 30.0 and is_urban) else "normal"
 
     # STAGE 5: ROUTES & EVACUATION INTERLOCK LAYER (DUAL PATHING)
-    standard_route_coords = [[s["lat"], s["lng"]] for s in inundated_streets[:6]]
-    
-    # Filter only unflooded or low-risk nodes for the safe bypass corridor
-    safe_corridor_nodes = [s for s in inundated_streets if s["depth_cm"] < 30.0]
-    safe_route_coords = [[s["lat"], s["lng"]] for s in safe_corridor_nodes[:8]]
-    
-    # Fallback coordinates if node density is low
-    if len(safe_route_coords) < 2:
-        safe_route_coords = [[target_lat, target_lng], [target_lat + 0.01, target_lng + 0.01]]
+    # Real routing on the OSM road graph (routing/flood_router.py):
+    # standard = shortest path from the centre to the edge of the mapped
+    # area; safe = shortest path that avoids closed/flooded roads.
+    depths_by_street = {s["id"]: s["depth_cm"] for s in inundated_streets}
+    closed_street_ids = {
+        s["id"] for s in inundated_streets if s["status"] == "Closed / Flooded"
+    }
+    route_plan = plan_routes(
+        real_roads,
+        depths_cm=depths_by_street,
+        closed_ids=closed_street_ids,
+        centre_lat=target_lat,
+        centre_lng=target_lng,
+    )
 
-    if len(standard_route_coords) < 2:
-        standard_route_coords = [[target_lat, target_lng], [target_lat - 0.01, target_lng - 0.01]]
+    if route_plan["route_source"] == "osm_graph":
+        standard_route_coords = route_plan["standard_shortest"]
+        safe_route_coords = route_plan["safe_bypass"]
+    else:
+        # The graph produced no path (e.g. synthetic fallback streets
+        # whose endpoints do not meet). Keep the legacy street-point
+        # slices so the frontend still draws something, honestly
+        # labelled via route_source="no_path" in the response.
+        standard_route_coords = [[s["lat"], s["lng"]] for s in inundated_streets[:6]]
+        safe_corridor_nodes = [s for s in inundated_streets if s["depth_cm"] < 30.0]
+        safe_route_coords = [[s["lat"], s["lng"]] for s in safe_corridor_nodes[:8]]
+        if len(safe_route_coords) < 2:
+            safe_route_coords = [[target_lat, target_lng], [target_lat + 0.01, target_lng + 0.01]]
+        if len(standard_route_coords) < 2:
+            standard_route_coords = [[target_lat, target_lng], [target_lat - 0.01, target_lng - 0.01]]
 
     peak_depth = max([s["depth_cm"] for s in inundated_streets]) if inundated_streets else 0.0
     latency_ms = round((time.perf_counter() - t_start) * 1000 + 35.0, 1)
@@ -298,7 +317,12 @@ async def coupled_nowcast(req: DynamicPointRequest):
         "drainage_conduits": drainage_conduits,
         "transit_routes": {
             "standard_shortest": standard_route_coords,
-            "safe_bypass": safe_route_coords
+            "safe_bypass": safe_route_coords,
+            "route_source": route_plan["route_source"],
+            "standard_length_m": route_plan["standard_length_m"],
+            "safe_length_m": route_plan["safe_length_m"],
+            "safe_route_available": route_plan["safe_route_available"],
+            "standard_uses_closed_road": route_plan["standard_uses_closed_road"]
         },
         "total_blocked_roads": blocked_count,
         "critical_subways_submerged": submerged_subways
