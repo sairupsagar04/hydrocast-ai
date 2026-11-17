@@ -182,9 +182,13 @@ async def coupled_nowcast(req: DynamicPointRequest):
     storm_core = np.exp(-((x - center)**2 + (y - center)**2) / (50.0**2)) * (rain_rate_mmhr * 0.4)
     rain_grid += storm_core.astype(np.float32)
 
-    depth_2d_grid = model2_engine.predict_depth_grid(rain_grid, model2_stack)
-
     runoff_coeff = 0.85 if is_urban else 0.18
+    depth_2d_grid = model2_engine.predict_depth_grid(
+        rain_grid,
+        model2_stack,
+        cumulative_rain_mm=sim_cm * 10.0,
+        runoff_coefficient=runoff_coeff,
+    )
     effective_rain_volume = sim_cm * runoff_coeff
     runoff_factor = (effective_rain_volume / 25.0) ** 1.6 if effective_rain_volume > 0 else 0.0
     step_factor = lead_time / 60.0
@@ -201,7 +205,7 @@ async def coupled_nowcast(req: DynamicPointRequest):
         base_depth = 28.0 if road.get("is_subway") else (5.0 if is_unpaved else 12.0)
 
         computed_depth = round(
-            (base_depth * runoff_factor) + (sim_cm * 1.8 * (1.2 if is_urban else 0.4)) + (cell_depth * 0.1),
+            (base_depth * runoff_factor) + (sim_cm * 1.8 * (1.2 if is_urban else 0.4)) + (cell_depth * 100.0),  # depth grid is in metres -> cm
             1
         )
 
@@ -280,6 +284,8 @@ async def coupled_nowcast(req: DynamicPointRequest):
         "source_mode": source_mode,
         "simulation_level": sim_cm,
         "zone_classification": zone_classification,
+        "model2_source": model2_engine.last_prediction_source,
+        "dem_source": spatial_engine.elevation_source,
         "is_urban": is_urban,
         "inundated_streets": inundated_streets,
         "drainage_nodes": drainage_nodes,
