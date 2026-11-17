@@ -16,6 +16,7 @@ from typing import Optional, List, Dict, Any
 from gis.spatial_engine import SpatialEngine
 from ml.inundation_surrogate import FusionNeuralNetwork
 from services.osm_service import fetch_roads_near_point
+from services.rainfall_service import fetch_rainfall
 
 load_dotenv()
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
@@ -36,29 +37,14 @@ app.add_middleware(
 
 def fetch_live_weather_from_api(lat: float, lng: float) -> float:
     """
-    Fetches real-time precipitation rate (mm/hr) from OpenWeatherMap API 
-    for the target coordinate.
+    Backwards-compatible wrapper: current precipitation rate (mm/hr)
+    from services.rainfall_service (OpenWeather measured value when
+    available, Open-Meteo otherwise). The old implementation returned
+    0.0 whenever no OpenWeather key was configured, and invented
+    15.5 mm/hr when the weather text mentioned rain without a measured
+    amount; both behaviours are gone.
     """
-    if not OPENWEATHER_API_KEY or OPENWEATHER_API_KEY == "your_actual_api_key_here":
-        print("[!] Notice: No valid OPENWEATHER_API_KEY found in .env. Using fallback simulation.")
-        return 0.0
-
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lng}&appid={OPENWEATHER_API_KEY}&units=metric"
-    try:
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            rain_data = data.get("rain", {})
-            rain_1h = rain_data.get("1h", 0.0)
-
-            weather_desc = data.get("weather", [{}])[0].get("main", "").lower()
-            if rain_1h == 0.0 and ("thunderstorm" in weather_desc or "rain" in weather_desc):
-                return 15.5
-            return float(rain_1h)
-    except Exception as e:
-        print(f"[!] Warning fetching live weather API: {e}")
-
-    return 0.0
+    return fetch_rainfall(lat, lng, api_key=OPENWEATHER_API_KEY or None).rate_mm_hr
 
 # -----------------------------------------------------------------------------
 # 1. LOAD MODEL 1 (ONNX Radar / Precipitation Nowcaster)
@@ -136,17 +122,32 @@ async def coupled_nowcast(req: DynamicPointRequest):
     is_live_mode = (req.simulation_level == 0) or (req.simulation_level is None and req.rainfall_accumulation_cm in (0, None))
 
     # STAGE 1: RUN MODEL 1 (Live API Feed vs Deluge Sandbox)
+    rainfall = None
     if is_live_mode:
-        live_rain_mmhr = fetch_live_weather_from_api(target_lat, target_lng)
+        rainfall = fetch_rainfall(
+            target_lat, target_lng,
+            lead_time_minutes=lead_time,
+            api_key=OPENWEATHER_API_KEY or None,
+        )
+        live_rain_mmhr = rainfall.rate_mm_hr
 
-        if live_rain_mmhr > 0.0:
-            source_mode = f"Live OpenWeather API Feed ({live_rain_mmhr} mm/hr)"
+        if not rainfall.data_available:
+            # No source responded: say so instead of claiming clear sky.
+            source_mode = "Live Rainfall Data Unavailable (no source responded)"
+            rain_rate_mmhr = 0.0
+            simulated_dbz = 10.0
+            storm_present = False
+            sim_cm = 0.0
+        elif live_rain_mmhr > 0.0:
+            source_mode = f"Live Rainfall Feed [{rainfall.source}] ({live_rain_mmhr} mm/hr)"
             rain_rate_mmhr = live_rain_mmhr
             simulated_dbz = min(65.0, 20.0 + (live_rain_mmhr * 1.5))
             storm_present = True
-            sim_cm = round(live_rain_mmhr * 0.15, 1)
+            # Physical accumulation over the requested lead time (mm -> cm),
+            # replacing the old rate * 0.15 fudge factor.
+            sim_cm = round(rainfall.accumulation_mm / 10.0, 1)
         else:
-            source_mode = "Live Satellite / Clear Sky (0 mm/hr)"
+            source_mode = f"Live Rainfall Feed [{rainfall.source}] (0 mm/hr)"
             rain_rate_mmhr = 0.0
             simulated_dbz = 10.0
             storm_present = False
@@ -286,6 +287,11 @@ async def coupled_nowcast(req: DynamicPointRequest):
         "zone_classification": zone_classification,
         "model2_source": model2_engine.last_prediction_source,
         "dem_source": spatial_engine.elevation_source,
+        "rainfall_source": rainfall.source if rainfall else "simulation_sandbox",
+        "rainfall_data_available": rainfall.data_available if rainfall else True,
+        "rainfall_accumulation_mm": rainfall.accumulation_mm if rainfall else round(sim_cm * 10.0, 1),
+        "antecedent_rain_3h_mm": rainfall.antecedent_3h_mm if rainfall else None,
+        "antecedent_rain_24h_mm": rainfall.antecedent_24h_mm if rainfall else None,
         "is_urban": is_urban,
         "inundated_streets": inundated_streets,
         "drainage_nodes": drainage_nodes,
