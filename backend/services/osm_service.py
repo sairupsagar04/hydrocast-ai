@@ -86,6 +86,14 @@ CONFIGURATION (environment variables, all optional)
     HYDROCAST_OSM_TIMEOUT        Overpass request timeout (s). Default 180.
     HYDROCAST_OSM_CACHE_TTL      Seconds a cached area stays valid.
                                  Default 1800 (30 minutes).
+    HYDROCAST_OVERPASS_URL       Overpass base URL (no "/interpreter").
+                                 Default https://overpass.private.coffee/api
+                                 (global mirror, no rate limit stated on
+                                 the OSM wiki). Falls back to the main
+                                 instance https://overpass-api.de/api if
+                                 the primary endpoint fails. A full
+                                 ".../api/interpreter" URL is accepted
+                                 and normalised to its base.
 
 DEPENDENCIES
     ``osmnx`` is already listed in backend/requirements.txt. It pulls in
@@ -129,6 +137,37 @@ MAX_WATERWAY_CONDUITS = _env_int("HYDROCAST_OSM_MAX_WATERWAYS", 30)
 OVERPASS_TIMEOUT_SECONDS = _env_int("HYDROCAST_OSM_TIMEOUT", 180)
 CACHE_TTL_SECONDS = _env_int("HYDROCAST_OSM_CACHE_TTL", 1800)
 CACHE_MAX_ENTRIES = 32
+
+# Overpass endpoint (base URL, no "/interpreter"). Default is the
+# private.coffee mirror: global coverage, 4 servers, and the OSM wiki
+# states no rate limit is in place (it asks to be notified before
+# large-scale use). The main FOSSGIS instance is the fallback, so a
+# mirror outage degrades to the old behaviour instead of the synthetic
+# fallback. Set HYDROCAST_OVERPASS_URL to try another mirror, or to
+# force the main instance, with no code change.
+OVERPASS_URL = (
+    os.getenv("HYDROCAST_OVERPASS_URL", "https://overpass.private.coffee/api").strip()
+    or "https://overpass.private.coffee/api"
+)
+OVERPASS_FALLBACK_URL = "https://overpass-api.de/api"
+
+
+def _overpass_base(url: str) -> str:
+    """Normalise an Overpass URL to its base (strip "/interpreter")."""
+    base = url.strip().rstrip("/")
+    if base.endswith("/interpreter"):
+        base = base[: -len("/interpreter")]
+    return base
+
+
+def _overpass_endpoints() -> List[str]:
+    """Primary endpoint first, main instance second, de-duplicated."""
+    endpoints: List[str] = []
+    for url in (OVERPASS_URL, OVERPASS_FALLBACK_URL):
+        base = _overpass_base(url)
+        if base and base not in endpoints:
+            endpoints.append(base)
+    return endpoints
 
 # Highway classes in priority order: major corridors are the roads that
 # matter most for flood blockage reporting, so they are returned first.
@@ -335,10 +374,19 @@ def _cache_put(key: str, payload: Dict[str, Any]) -> None:
 # OpenStreetMap fetching (OSMnx / Overpass)
 # ---------------------------------------------------------------------------
 
-def _import_osmnx():
-    """Import OSMnx lazily so this module still loads without it."""
+def _import_osmnx(endpoint: Optional[str] = None):
+    """Import OSMnx lazily so this module still loads without it.
+
+    Sets the Overpass endpoint for this fetch. OSMnx 2.x reads
+    ``settings.overpass_url`` (base URL, no "/interpreter"); OSMnx 1.x
+    reads ``settings.overpass_endpoint`` (full ".../api/interpreter"
+    URL). Both are set, each guarded, so the same code works on
+    either version and an unknown attribute never breaks the fetch.
+    """
     import osmnx as ox
 
+    base = _overpass_base(endpoint or OVERPASS_URL)
+    full = base + "/interpreter"
     try:
         ox.settings.use_cache = True
         ox.settings.log_console = False
@@ -347,20 +395,42 @@ def _import_osmnx():
         # Settings attributes differ slightly across OSMnx versions;
         # failing to set them must not break the fetch itself.
         pass
+    for attr, value in (("overpass_url", base), ("overpass_endpoint", full)):
+        try:
+            setattr(ox.settings, attr, value)
+        except Exception:
+            pass
     return ox
 
 
 def _fetch_road_graph(lat: float, lng: float, radius_meters: int):
-    """Download the real road graph around a point from OpenStreetMap."""
-    ox = _import_osmnx()
-    return ox.graph_from_point(
-        (lat, lng),
-        dist=radius_meters,
-        network_type=NETWORK_TYPE,
-        simplify=True,
-        retain_all=False,
-        truncate_by_edge=True,
-    )
+    """Download the real road graph around a point from OpenStreetMap.
+
+    Tries each Overpass endpoint in turn (primary mirror, then the
+    main instance) so one slow/down mirror does not by itself force
+    the synthetic fallback.
+    """
+    last_error: Optional[Exception] = None
+    for endpoint in _overpass_endpoints():
+        try:
+            ox = _import_osmnx(endpoint)
+            return ox.graph_from_point(
+                (lat, lng),
+                dist=radius_meters,
+                network_type=NETWORK_TYPE,
+                simplify=True,
+                retain_all=False,
+                truncate_by_edge=True,
+            )
+        except Exception as error:  # noqa: BLE001 - try next endpoint
+            last_error = error
+            print(
+                f"[!] Warning: Overpass endpoint {endpoint} failed "
+                f"({error}); trying the next endpoint."
+            )
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No Overpass endpoint configured")
 
 
 def _node_lat_lng(graph, node_id: Any) -> Optional[Tuple[float, float]]:
@@ -674,9 +744,22 @@ def _fetch_waterway_conduits(
     here must never break the road result, so callers wrap this in
     try/except and this function itself returns [] on empty results.
     """
-    ox = _import_osmnx()
-    tags = {"waterway": ["river", "stream", "canal", "drain", "ditch"]}
-    features = ox.features_from_point((lat, lng), tags=tags, dist=radius_meters)
+    last_error: Optional[Exception] = None
+    for endpoint in _overpass_endpoints():
+        try:
+            ox = _import_osmnx(endpoint)
+            tags = {"waterway": ["river", "stream", "canal", "drain", "ditch"]}
+            features = ox.features_from_point((lat, lng), tags=tags, dist=radius_meters)
+            break
+        except Exception as error:  # noqa: BLE001 - try next endpoint
+            last_error = error
+            print(
+                f"[!] Warning: Overpass endpoint {endpoint} failed for "
+                f"waterways ({error}); trying the next endpoint."
+            )
+            features = None
+    else:
+        return []
     if features is None:
         return []
 
