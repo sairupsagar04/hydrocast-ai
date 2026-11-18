@@ -42,6 +42,25 @@ DRAINAGE - READ THIS BEFORE CLAIMING OTHERWISE IN A DEMO / VIVA
     3. Rural areas return no modelled drainage (matching the previous
        behaviour), though real OSM waterways are still returned.
 
+OFFLINE HYDERABAD EXTRACT (LOCAL-FIRST)
+    In production (Render), Overpass requests time out often enough
+    that live fetching fell back to the synthetic layout and the flood
+    router reported ``route_source="no_path"``. So for the Hyderabad
+    area this module first tries a precomputed offline extract
+    (``backend/data/hyderabad_osm.part*.json`` plus a
+    ``hyderabad_osm.manifest.json`` index, built by
+    ``backend/scripts/build_hyderabad_extract.py`` from OpenStreetMap
+    data, refreshed monthly or on demand; the extract is split into
+    <= ~4.5 MB parts because the GitHub transport used for this repo
+    rejects larger single files). If the requested point and
+    its full search radius lie inside the extract coverage, roads and
+    waterways are served from that file - same shaping code, same
+    contract, ``data_source="openstreetmap"`` plus a
+    ``data_extract_date`` field so the snapshot's age is visible.
+    Points outside coverage use the live Overpass path below. If the
+    extract files are missing or corrupt, the module logs a warning and
+    falls through to the live path; it never crashes on a bad file.
+
 FALLBACK
     If OSMnx is not installed, Overpass is unreachable, or no roads are
     found, the module falls back to ``get_fast_fallback()`` - the same
@@ -74,6 +93,8 @@ RETURN CONTRACT (unchanged - backend/main.py and the frontend depend on it)
         "data_source": "openstreetmap" | "synthetic_fallback",
         "drainage_source": str,
         "source_attribution": "(c) OpenStreetMap contributors",
+        # Present only when served from the offline extract:
+        "data_extract_date": "YYYY-MM-DD",
     }
 
 CONFIGURATION (environment variables, all optional)
@@ -86,6 +107,14 @@ CONFIGURATION (environment variables, all optional)
     HYDROCAST_OSM_TIMEOUT        Overpass request timeout (s). Default 180.
     HYDROCAST_OSM_CACHE_TTL      Seconds a cached area stays valid.
                                  Default 1800 (30 minutes).
+    HYDROCAST_OSM_EXTRACT        Path to a single-file offline Hyderabad
+                                 extract JSON (local experiments). When
+                                 unset, the split extract in backend/data/
+                                 (hyderabad_osm.manifest.json +
+                                 hyderabad_osm.part*.json) is used.
+    HYDROCAST_OSM_EXTRACT_MANIFEST
+                                 Path to the split extract's manifest.
+                                 Default backend/data/hyderabad_osm.manifest.json.
     HYDROCAST_OVERPASS_URL       Overpass base URL (no "/interpreter").
                                  Default https://overpass.private.coffee/api
                                  (global mirror, no rate limit stated on
@@ -106,6 +135,8 @@ maps built from this data.
 """
 
 import copy
+import gzip
+import json
 import math
 import os
 import time
@@ -368,6 +399,358 @@ def _cache_put(key: str, payload: Dict[str, Any]) -> None:
     _CACHE.move_to_end(key)
     while len(_CACHE) > CACHE_MAX_ENTRIES:
         _CACHE.popitem(last=False)
+
+
+# ---------------------------------------------------------------------------
+# Offline Hyderabad extract (local-first; see module docstring)
+# ---------------------------------------------------------------------------
+
+_EXTRACT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "data",
+)
+
+EXTRACT_PATH = os.getenv(
+    "HYDROCAST_OSM_EXTRACT",
+    os.path.join(_EXTRACT_DIR, "hyderabad_osm.json"),
+)
+
+EXTRACT_MANIFEST_PATH = os.getenv(
+    "HYDROCAST_OSM_EXTRACT_MANIFEST",
+    os.path.join(_EXTRACT_DIR, "hyderabad_osm.manifest.json"),
+)
+
+_EXTRACT: Optional[Dict[str, Any]] = None
+_EXTRACT_LOAD_ATTEMPTED = False
+
+
+def _read_extract_json(path: str) -> Any:
+    if str(path).endswith(".gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            return json.load(handle)
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _load_extract_data() -> "tuple[Dict[str, Any], str]":
+    """Read the offline extract from disk, merging split part files.
+
+    The committed extract is split into <= ~4.5 MB part files listed in
+    a manifest (the GitHub transport used for this repo rejects larger
+    single files). Each part holds consecutive chunks of the top-level
+    arrays, so merging is plain concatenation in manifest order and
+    every stored node/name index reference stays valid. A single-file
+    extract (HYDROCAST_OSM_EXTRACT) is still honoured when set.
+    Returns (data, source_description).
+    """
+    if not os.getenv("HYDROCAST_OSM_EXTRACT") and os.path.exists(
+        EXTRACT_MANIFEST_PATH
+    ):
+        manifest = _read_extract_json(EXTRACT_MANIFEST_PATH)
+        base_dir = os.path.dirname(os.path.abspath(EXTRACT_MANIFEST_PATH))
+        merged: Dict[str, Any] = {}
+        for part_name in manifest["parts"]:
+            part = _read_extract_json(os.path.join(base_dir, str(part_name)))
+            for key, value in part.items():
+                if isinstance(value, list) and isinstance(
+                    merged.get(key), list
+                ):
+                    merged[key].extend(value)
+                else:
+                    merged[key] = value
+        return merged, (
+            f"{EXTRACT_MANIFEST_PATH} "
+            f"({len(manifest['parts'])} part files)"
+        )
+    return _read_extract_json(EXTRACT_PATH), EXTRACT_PATH
+
+
+def _load_extract() -> Optional[Dict[str, Any]]:
+    """Load the offline extract once, lazily. None if unavailable.
+
+    A missing or corrupt file must never break the service: log and
+    return None so callers fall through to the live Overpass path.
+    """
+    global _EXTRACT, _EXTRACT_LOAD_ATTEMPTED
+    if _EXTRACT_LOAD_ATTEMPTED:
+        return _EXTRACT
+    _EXTRACT_LOAD_ATTEMPTED = True
+    try:
+        data, extract_source = _load_extract_data()
+        metadata = data["metadata"]
+        # Touch the required keys so a truncated/foreign file fails here.
+        _ = (
+            metadata["bbox"],
+            metadata["coordinate_scale"],
+            metadata["grid_cell_degrees"],
+            metadata["hw_values"],
+            data["names"],
+            data["nodes"],
+            data["edges"],
+            data["waterways"],
+        )
+        # Decode the flat delta-encoded node table once, here, so the
+        # per-query lookups stay simple indexing.
+        flat = data["nodes"]
+        decoded_nodes: List[List[int]] = []
+        _lat = _lng = 0
+        for i in range(0, len(flat) - 1, 2):
+            _lat += int(flat[i])
+            _lng += int(flat[i + 1])
+            decoded_nodes.append([_lat, _lng])
+        data["_nodes_decoded"] = decoded_nodes
+        # Build the spatial grid in memory (it is deliberately not
+        # stored in the file - rebuilding it here costs a fraction of
+        # a second and saves ~3 MB of JSON). Each edge is bucketed by
+        # its midpoint into grid_cell_degrees cells; the midpoint node
+        # index is recovered by decoding only the first half of the
+        # edge's delta-encoded node sequence.
+        cell_degrees = float(metadata["grid_cell_degrees"])
+        coord_scale = float(metadata["coordinate_scale"])
+        grid: Dict[str, List[int]] = {}
+        for edge_index, raw_edge in enumerate(data["edges"]):
+            sequence = raw_edge[0]
+            midpoint_pos = len(sequence) // 2
+            node_index = int(sequence[0])
+            for delta in sequence[1 : midpoint_pos + 1]:
+                node_index += int(delta)
+            mid_lat = decoded_nodes[node_index][0] / coord_scale
+            mid_lng = decoded_nodes[node_index][1] / coord_scale
+            cell_key = (
+                f"{math.floor(mid_lat / cell_degrees)}:"
+                f"{math.floor(mid_lng / cell_degrees)}"
+            )
+            grid.setdefault(cell_key, []).append(edge_index)
+        data["grid"] = grid
+        _EXTRACT = data
+        print(
+            f"[i] Offline OSM extract loaded: {extract_source} "
+            f"({metadata.get('edge_count', len(data['edges']))} edges, "
+            f"extract date {metadata.get('extract_date', 'unknown')})."
+        )
+    except Exception as error:  # noqa: BLE001 - fall through to live path
+        print(
+            f"[!] Warning: offline OSM extract unavailable ({error}). "
+            "Using live Overpass fetching."
+        )
+        _EXTRACT = None
+    return _EXTRACT
+
+
+def _extract_covers(lat: float, lng: float, radius_meters: int) -> bool:
+    """True if the point AND its full search circle sit inside coverage."""
+    data = _load_extract()
+    if data is None:
+        return False
+    south, west, north, east = (float(v) for v in data["metadata"]["bbox"])
+    lat_margin = radius_meters / 111320.0
+    lng_margin = radius_meters / (
+        111320.0 * max(0.1, math.cos(math.radians(lat)))
+    )
+    return (
+        south + lat_margin <= lat <= north - lat_margin
+        and west + lng_margin <= lng <= east - lng_margin
+    )
+
+
+def _extract_coords(
+    data: Dict[str, Any], node_indices: Sequence[int]
+) -> List[List[float]]:
+    """Materialise [[lat, lng], ...] for a stored node-index sequence."""
+    scale = float(data["metadata"]["coordinate_scale"])
+    nodes = data["_nodes_decoded"]
+    return [
+        [nodes[idx][0] / scale, nodes[idx][1] / scale] for idx in node_indices
+    ]
+
+
+def _delta_decode(sequence: Sequence[int]) -> List[int]:
+    decoded = [int(sequence[0])]
+    for delta in sequence[1:]:
+        decoded.append(decoded[-1] + int(delta))
+    return decoded
+
+
+def _decode_extract_edge(data: Dict[str, Any], raw: Any) -> Dict[str, Any]:
+    """Decode one format-2 edge row into the builder's dict shape."""
+    return {
+        "n": _delta_decode(raw[0]),
+        "name": data["names"][int(raw[1])],
+        "hw": data["metadata"]["hw_values"][int(raw[2])],
+        "sf": raw[3] if len(raw) > 3 else "",
+        "tun": raw[4] if len(raw) > 4 else "",
+        "loc": raw[5] if len(raw) > 5 else "",
+    }
+
+
+def _decode_extract_waterway(data: Dict[str, Any], raw: Any) -> Dict[str, Any]:
+    """Decode one format-2 waterway row into the builder's dict shape."""
+    return {
+        "n": _delta_decode(raw[0]),
+        "name": data["names"][int(raw[1])],
+        "ww": raw[2],
+    }
+
+
+def _extract_local_edges(
+    lat: float, lng: float, radius_meters: int
+) -> Tuple[List[Dict[str, Any]], Any]:
+    """Road edges near a point from the offline extract.
+
+    Returns edges in exactly the shape ``_extract_edges`` produces for
+    the live path, plus a minimal graph object (``.nodes`` mapping
+    node-index -> {"x": lng, "y": lat}) so ``_build_modelled_drainage``
+    works unchanged. Raises if the extract cannot serve the point.
+    """
+    data = _load_extract()
+    if data is None:
+        raise RuntimeError("Offline OSM extract is not available")
+
+    cell_degrees = float(data["metadata"]["grid_cell_degrees"])
+    lat_margin = radius_meters / 111320.0
+    lng_margin = radius_meters / (
+        111320.0 * max(0.1, math.cos(math.radians(lat)))
+    )
+
+    candidate_indices: set = set()
+    cell_x_range = range(
+        math.floor((lat - lat_margin) / cell_degrees),
+        math.floor((lat + lat_margin) / cell_degrees) + 1,
+    )
+    cell_y_range = range(
+        math.floor((lng - lng_margin) / cell_degrees),
+        math.floor((lng + lng_margin) / cell_degrees) + 1,
+    )
+    grid = data["grid"]
+    for cell_x in cell_x_range:
+        for cell_y in cell_y_range:
+            candidate_indices.update(grid.get(f"{cell_x}:{cell_y}", []))
+
+    edges: List[Dict[str, Any]] = []
+    node_positions: Dict[Any, Dict[str, float]] = {}
+    seen: set = set()
+    for index in candidate_indices:
+        raw = _decode_extract_edge(data, data["edges"][index])
+        node_seq = raw["n"]
+        if len(node_seq) < 2:
+            continue
+        coords = _extract_coords(data, node_seq)
+        length_m = _coords_length_m(coords)
+        mid_lat, mid_lng = coords[len(coords) // 2]
+        distance_m = _haversine_m(lat, lng, mid_lat, mid_lng)
+        # Keep edges that at least partly cross the search circle.
+        if distance_m > radius_meters + length_m / 2.0:
+            continue
+        dedupe_key = (
+            frozenset((node_seq[0], node_seq[-1])),
+            str(raw.get("name", "")).lower(),
+            round(coords[0][0], 5),
+            round(coords[0][1], 5),
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        u, v = node_seq[0], node_seq[-1]
+        for node_idx, (node_lat, node_lng) in (
+            (u, coords[0]),
+            (v, coords[-1]),
+        ):
+            node_positions.setdefault(
+                node_idx, {"x": float(node_lng), "y": float(node_lat)}
+            )
+
+        name = str(raw.get("name", "") or "")
+        highway = str(raw.get("hw", "") or "unclassified")
+        edges.append(
+            {
+                "u": u,
+                "v": v,
+                "name": name,
+                "highway": highway,
+                "coords": _downsample_coords(coords),
+                "lat": float(mid_lat),
+                "lng": float(mid_lng),
+                "length_m": round(float(length_m), 1),
+                "surface": _surface_from_tags(str(raw.get("sf", "") or ""), highway),
+                "is_subway": _is_subway_from_tags(
+                    name,
+                    {
+                        "tunnel": str(raw.get("tun", "") or ""),
+                        "location": str(raw.get("loc", "") or ""),
+                    },
+                ),
+                "distance_m": distance_m,
+            }
+        )
+
+    if not edges:
+        raise ValueError("No offline-extract roads found around this point")
+
+    class _LocalGraph:
+        """Minimal stand-in for the OSMnx graph used by drainage code."""
+
+        def __init__(self, nodes: Dict[Any, Dict[str, float]]):
+            self.nodes = nodes
+
+    return edges, _LocalGraph(node_positions)
+
+
+def _extract_local_waterways(
+    lat: float, lng: float, radius_meters: int
+) -> List[Dict[str, Any]]:
+    """Real OSM waterways near a point, from the offline extract.
+
+    Same conduit shape as ``_fetch_waterway_conduits``.
+    """
+    data = _load_extract()
+    if data is None:
+        return []
+
+    found: List[Tuple[float, Dict[str, Any]]] = []
+    for encoded in data["waterways"]:
+        raw = _decode_extract_waterway(data, encoded)
+        node_seq = raw["n"]
+        if len(node_seq) < 2:
+            continue
+        coords = _extract_coords(data, node_seq)
+        length_m = _coords_length_m(coords)
+        mid_lat, mid_lng = coords[len(coords) // 2]
+        distance_m = _haversine_m(lat, lng, mid_lat, mid_lng)
+        if distance_m > radius_meters + length_m / 2.0:
+            continue
+        found.append((distance_m, raw))
+
+    found.sort(key=lambda item: item[0])
+    conduits: List[Dict[str, Any]] = []
+    for _distance, raw in found[:MAX_WATERWAY_CONDUITS]:
+        coords = _downsample_coords(_extract_coords(data, raw["n"]))
+        waterway_type = str(raw.get("ww", "") or "stream")
+        name = str(raw.get("name", "") or "") or f"Unnamed {waterway_type}"
+        public_id = f"wc-{len(conduits) + 1}"
+        conduits.append(
+            {
+                "id": public_id,
+                "name": name,
+                "from_node": f"{public_id}-a",
+                "to_node": f"{public_id}-b",
+                "length_m": int(round(_coords_length_m(coords))),
+                "diameter_mm": DIAMETER_BY_WATERWAY.get(
+                    waterway_type, DEFAULT_DIAMETER_MM
+                ),
+                "slope": DEFAULT_WATERWAY_SLOPE,
+                "coordinates": coords,
+                "capacity_used_pct": BASELINE_CAPACITY_USED_PCT,
+                "status": "normal",
+                # Additive metadata:
+                "source": "openstreetmap",
+                "is_modelled": False,
+                "channel_type": waterway_type,
+                "diameter_is_estimate": True,
+            }
+        )
+    return conduits
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +1186,60 @@ def _fetch_waterway_conduits(
 
 
 # ---------------------------------------------------------------------------
+# Shared result assembly (live Overpass path and offline extract path)
+# ---------------------------------------------------------------------------
+
+def _assemble_result(
+    graph,
+    edges: List[Dict[str, Any]],
+    lat: float,
+    lng: float,
+    radius_meters: int,
+    resolved_place: str,
+    waterway_conduits: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the contract result from normalised edges.
+
+    Used by both the live Overpass path and the offline extract path so
+    streets, modelled drainage and metadata are shaped identically
+    regardless of where the road geometry came from.
+    """
+    is_urban = _estimate_is_urban(edges, radius_meters)
+    zone_type = (
+        f"Urban Municipal Sector ({resolved_place})"
+        if is_urban
+        else f"Rural Catchment / Outskirts ({resolved_place})"
+    )
+
+    streets = _build_streets(edges, resolved_place)
+
+    conduits: List[Dict[str, Any]] = []
+    manholes: List[Dict[str, Any]] = []
+    drainage_notes = ["no modelled drainage (rural area)"]
+    if is_urban:
+        conduits, manholes = _build_modelled_drainage(
+            graph, edges, lat, lng, resolved_place
+        )
+        drainage_notes = ["modelled from road network topology"]
+
+    if waterway_conduits:
+        conduits = conduits + waterway_conduits
+        drainage_notes.append(f"{len(waterway_conduits)} real OSM waterway(s)")
+
+    return {
+        "zone_classification": zone_type,
+        "is_urban": is_urban,
+        "streets": streets,
+        "conduits": conduits,
+        "manholes": manholes,
+        # Additive metadata:
+        "data_source": "openstreetmap",
+        "drainage_source": "; ".join(drainage_notes),
+        "source_attribution": "(c) OpenStreetMap contributors",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public entry point (signature and return shape unchanged)
 # ---------------------------------------------------------------------------
 
@@ -832,56 +1269,64 @@ def fetch_roads_near_point(
     if cached is not None:
         return cached
 
+    # Local-first: serve from the offline Hyderabad extract when the
+    # point and its full search radius are inside extract coverage.
+    # Any failure here falls through to the live path below.
+    if _extract_covers(float(lat), float(lng), int(radius_meters)):
+        try:
+            local_edges, local_graph = _extract_local_edges(
+                float(lat), float(lng), int(radius_meters)
+            )
+            local_waterways = _extract_local_waterways(
+                float(lat), float(lng), int(radius_meters)
+            )
+            local_result = _assemble_result(
+                local_graph,
+                local_edges,
+                float(lat),
+                float(lng),
+                int(radius_meters),
+                resolved_place,
+                local_waterways,
+            )
+            extract = _load_extract()
+            local_result["data_extract_date"] = str(
+                (extract or {}).get("metadata", {}).get("extract_date", "")
+            )
+            _cache_put(cache_key, local_result)
+            return local_result
+        except Exception as local_error:
+            print(
+                f"[!] Warning: offline OSM extract lookup failed "
+                f"({local_error}). Falling back to live Overpass fetching."
+            )
+
     try:
         graph = _fetch_road_graph(float(lat), float(lng), int(radius_meters))
         edges = _extract_edges(graph, float(lat), float(lng))
         if not edges:
             raise ValueError("No OpenStreetMap roads found around this point")
 
-        is_urban = _estimate_is_urban(edges, int(radius_meters))
-        zone_type = (
-            f"Urban Municipal Sector ({resolved_place})"
-            if is_urban
-            else f"Rural Catchment / Outskirts ({resolved_place})"
-        )
-
-        streets = _build_streets(edges, resolved_place)
-
-        conduits: List[Dict[str, Any]] = []
-        manholes: List[Dict[str, Any]] = []
-        drainage_notes = ["no modelled drainage (rural area)"]
-        if is_urban:
-            conduits, manholes = _build_modelled_drainage(
-                graph, edges, float(lat), float(lng), resolved_place
-            )
-            drainage_notes = ["modelled from road network topology"]
-
+        waterway_conduits: List[Dict[str, Any]] = []
         try:
             waterway_conduits = _fetch_waterway_conduits(
                 float(lat), float(lng), int(radius_meters)
             )
-            if waterway_conduits:
-                conduits = conduits + waterway_conduits
-                drainage_notes.append(
-                    f"{len(waterway_conduits)} real OSM waterway(s)"
-                )
         except Exception as waterway_error:
             print(
                 f"[!] Warning: OSM waterway fetch failed ({waterway_error}). "
                 "Continuing with roads and modelled drainage only."
             )
 
-        result: Dict[str, Any] = {
-            "zone_classification": zone_type,
-            "is_urban": is_urban,
-            "streets": streets,
-            "conduits": conduits,
-            "manholes": manholes,
-            # Additive metadata:
-            "data_source": "openstreetmap",
-            "drainage_source": "; ".join(drainage_notes),
-            "source_attribution": "(c) OpenStreetMap contributors",
-        }
+        result = _assemble_result(
+            graph,
+            edges,
+            float(lat),
+            float(lng),
+            int(radius_meters),
+            resolved_place,
+            waterway_conduits,
+        )
         _cache_put(cache_key, result)
         return result
 
