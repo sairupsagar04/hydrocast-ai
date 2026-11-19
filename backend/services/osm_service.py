@@ -47,19 +47,26 @@ OFFLINE HYDERABAD EXTRACT (LOCAL-FIRST)
     that live fetching fell back to the synthetic layout and the flood
     router reported ``route_source="no_path"``. So for the Hyderabad
     area this module first tries a precomputed offline extract
-    (``backend/data/hyderabad_osm.part*.json`` plus a
+    (``backend/data/tiles/hyd_r*_c*.json`` tile files plus a
     ``hyderabad_osm.manifest.json`` index, built by
     ``backend/scripts/build_hyderabad_extract.py`` from OpenStreetMap
-    data, refreshed monthly or on demand; the extract is split into
-    <= ~4.5 MB parts because the GitHub transport used for this repo
-    rejects larger single files). If the requested point and
-    its full search radius lie inside the extract coverage, roads and
-    waterways are served from that file - same shaping code, same
-    contract, ``data_source="openstreetmap"`` plus a
-    ``data_extract_date`` field so the snapshot's age is visible.
-    Points outside coverage use the live Overpass path below. If the
-    extract files are missing or corrupt, the module logs a warning and
-    falls through to the live path; it never crashes on a bad file.
+    data, refreshed monthly or on demand). The extract is cut into
+    geographic tiles (0.05 degrees, 10x10 over the coverage bbox);
+    each tile holds only the edges/waterways whose geometry
+    intersects it. A query loads and parses ONLY the tiles under its
+    search area - a 2 km radius query touches at most 4 tiles
+    geometrically - and merges them into compact arrays scoped to
+    the query, so the extract's memory cost is a few MB instead of
+    the ~143 MB peak / ~85 MB retained of the previous whole-city
+    loader (which OOM-killed the 512 MB production instance). If the
+    requested point and its full search radius lie inside the
+    extract coverage, roads and waterways are served from the tiles -
+    same shaping code, same contract, ``data_source="openstreetmap"``
+    plus a ``data_extract_date`` field so the snapshot's age is
+    visible. Points outside coverage use the live Overpass path
+    below. If the extract files are missing or corrupt, the module
+    logs a warning and falls through to the live path; it never
+    crashes on a bad file.
 
 FALLBACK
     If OSMnx is not installed, Overpass is unreachable, or no roads are
@@ -107,14 +114,19 @@ CONFIGURATION (environment variables, all optional)
     HYDROCAST_OSM_TIMEOUT        Overpass request timeout (s). Default 180.
     HYDROCAST_OSM_CACHE_TTL      Seconds a cached area stays valid.
                                  Default 1800 (30 minutes).
-    HYDROCAST_OSM_EXTRACT        Path to a single-file offline Hyderabad
-                                 extract JSON (local experiments). When
-                                 unset, the split extract in backend/data/
-                                 (hyderabad_osm.manifest.json +
-                                 hyderabad_osm.part*.json) is used.
+    HYDROCAST_OSM_EXTRACT        Path to a legacy single-file (format 2)
+                                 offline Hyderabad extract JSON. When set,
+                                 the WHOLE extract is loaded into compact
+                                 arrays on first use (~143 MB peak) - kept
+                                 for local experiments only; production
+                                 should use the tiled extract below.
     HYDROCAST_OSM_EXTRACT_MANIFEST
-                                 Path to the split extract's manifest.
+                                 Path to the tiled extract's manifest
+                                 (format 3). Tile files are resolved
+                                 relative to the manifest's directory.
                                  Default backend/data/hyderabad_osm.manifest.json.
+    HYDROCAST_OSM_TILE_CACHE     Max compact tiles kept in the in-memory
+                                 LRU cache. Default 8.
     HYDROCAST_OVERPASS_URL       Overpass base URL (no "/interpreter").
                                  Default https://overpass.private.coffee/api
                                  (global mirror, no rate limit stated on
@@ -620,6 +632,10 @@ def _build_compact_extract() -> Dict[str, Any]:
 def _load_extract() -> Optional[Dict[str, Any]]:
     """Load the offline extract once, lazily. None if unavailable.
 
+    LEGACY: this whole-city loader is used only when the
+    HYDROCAST_OSM_EXTRACT single-file override is set. The default
+    path is the format-3 tiled loader further below.
+
     A missing or corrupt file must never break the service: log and
     return None so callers fall through to the live Overpass path.
     """
@@ -652,12 +668,426 @@ def _load_extract() -> Optional[Dict[str, Any]]:
     return _EXTRACT
 
 
+# ---------------------------------------------------------------------------
+# Format-3 tiled extract (default path)
+#
+# The whole-city loader above is retained ONLY for the legacy
+# HYDROCAST_OSM_EXTRACT single-file override. The committed extract is
+# format 3: a manifest plus geographic tile files under backend/data/
+# tiles/. A query parses only the tiles under its search area into
+# compact per-tile arrays (LRU-cached), then merges just the edges
+# whose midpoint falls in the query's candidate grid cells - the same
+# candidate set the whole-city loader's midpoint grid produced - into
+# a query-scoped structure with the exact shape _build_compact_extract
+# returns, so all downstream shaping code is unchanged. Tiles store
+# GLOBAL edge/node ids (delta-encoded), so merging dedupes boundary-
+# crossing edges by id and keeps exact global node identity.
+# ---------------------------------------------------------------------------
+
+TILE_CACHE_MAX = _env_int("HYDROCAST_OSM_TILE_CACHE", 8)
+
+_EXTRACT_MANIFEST: Optional[Dict[str, Any]] = None
+_EXTRACT_MANIFEST_ATTEMPTED = False
+_TILE_CACHE: "OrderedDict[Tuple[int, int], Dict[str, Any]]" = OrderedDict()
+
+
+def _load_extract_manifest() -> Optional[Dict[str, Any]]:
+    """Load the format-3 extract manifest once. None if unavailable.
+
+    The manifest is tiny (a few KB), so - unlike the legacy loader -
+    coverage checks never trigger a data load.
+    """
+    global _EXTRACT_MANIFEST, _EXTRACT_MANIFEST_ATTEMPTED
+    if _EXTRACT_MANIFEST_ATTEMPTED:
+        return _EXTRACT_MANIFEST
+    _EXTRACT_MANIFEST_ATTEMPTED = True
+    try:
+        manifest = _read_extract_json(EXTRACT_MANIFEST_PATH)
+        if int(manifest.get("format", 0)) != 3:
+            raise ValueError(
+                f"unsupported extract format {manifest.get('format')!r}"
+            )
+        # Touch the required keys so a truncated/foreign file fails
+        # here rather than at query time.
+        _ = (
+            manifest["bbox"],
+            manifest["coordinate_scale"],
+            manifest["grid_cell_degrees"],
+            manifest["hw_values"],
+            manifest["tile_degrees"],
+            manifest["tile_rows"],
+            manifest["tile_cols"],
+            manifest["tiles"],
+        )
+        _EXTRACT_MANIFEST = manifest
+        print(
+            f"[i] Offline OSM extract manifest loaded: "
+            f"{EXTRACT_MANIFEST_PATH} ({manifest.get('edge_count')} "
+            f"edges in {len(manifest['tiles'])} tiles, extract date "
+            f"{manifest.get('extract_date', 'unknown')})."
+        )
+    except Exception as error:  # noqa: BLE001 - fall through to live path
+        print(
+            f"[!] Warning: offline OSM extract manifest unavailable "
+            f"({error}). Using live Overpass fetching."
+        )
+        _EXTRACT_MANIFEST = None
+    return _EXTRACT_MANIFEST
+
+
+def _tile_file_path(
+    manifest: Dict[str, Any], row: int, col: int
+) -> str:
+    base_dir = os.path.dirname(os.path.abspath(EXTRACT_MANIFEST_PATH))
+    tile_dir = str(manifest.get("tile_dir", "tiles"))
+    template = str(
+        manifest.get("tile_file_template", "hyd_r{row:02d}_c{col:02d}.json")
+    )
+    return os.path.join(
+        base_dir, tile_dir, template.format(row=row, col=col)
+    )
+
+
+def _build_compact_tile(path: str) -> Dict[str, Any]:
+    """Parse one tile file and convert it to compact flat arrays.
+
+    Same conversion discipline as _build_compact_extract (the parsed
+    JSON graph is released as soon as the arrays are built), but a
+    tile is ~0.7 MB on disk, so the transient is a few MB.
+    """
+    raw = _read_extract_json(path)
+    names = raw["names"]
+    node_lat: array = array("i")
+    node_lng: array = array("i")
+    run_lat = 0
+    run_lng = 0
+    flat = raw["nodes"]
+    for i in range(0, len(flat) - 1, 2):
+        run_lat += int(flat[i])
+        run_lng += int(flat[i + 1])
+        node_lat.append(run_lat)
+        node_lng.append(run_lng)
+    node_ids: array = array("i")
+    run_id = 0
+    for delta in raw["node_ids"]:
+        run_id += int(delta)
+        node_ids.append(run_id)
+    edge_ids: array = array("i")
+    edge_offsets: array = array("i", [0])
+    edge_nodes: array = array("i")
+    edge_name: array = array("i")
+    edge_hw: array = array("b")
+    edge_sf: array = array("i")
+    edge_tun: array = array("i")
+    edge_loc: array = array("i")
+    sf_vocab = _Vocab()
+    tun_vocab = _Vocab()
+    loc_vocab = _Vocab()
+    run_edge = 0
+    for row in raw["edges"]:
+        run_edge += int(row[0])
+        edge_ids.append(run_edge)
+        edge_nodes.extend(_delta_decode(row[1]))
+        edge_offsets.append(len(edge_nodes))
+        edge_name.append(int(row[2]))
+        edge_hw.append(int(row[3]))
+        edge_sf.append(sf_vocab.intern(row[4] if len(row) > 4 else ""))
+        edge_tun.append(tun_vocab.intern(row[5] if len(row) > 5 else ""))
+        edge_loc.append(loc_vocab.intern(row[6] if len(row) > 6 else ""))
+    waterways: List[Tuple[int, List[int], int, str]] = []
+    run_ww = 0
+    for row in raw["waterways"]:
+        run_ww += int(row[0])
+        waterways.append(
+            (run_ww, _delta_decode(row[1]), int(row[2]), str(row[3]))
+        )
+    del raw
+    return {
+        "names": names,
+        "node_lat": node_lat,
+        "node_lng": node_lng,
+        "node_ids": node_ids,
+        "edge_ids": edge_ids,
+        "edge_offsets": edge_offsets,
+        "edge_nodes": edge_nodes,
+        "edge_name": edge_name,
+        "edge_hw": edge_hw,
+        "edge_sf": edge_sf,
+        "sf_values": sf_vocab.values,
+        "edge_tun": edge_tun,
+        "tun_values": tun_vocab.values,
+        "edge_loc": edge_loc,
+        "loc_values": loc_vocab.values,
+        "waterways": waterways,
+    }
+
+
+def _load_tile(row: int, col: int) -> Dict[str, Any]:
+    """Compact tile (row, col), LRU-cached. Raises if unavailable."""
+    key = (row, col)
+    cached = _TILE_CACHE.get(key)
+    if cached is not None:
+        _TILE_CACHE.move_to_end(key)
+        return cached
+    manifest = _load_extract_manifest()
+    if manifest is None:
+        raise RuntimeError("Offline OSM extract is not available")
+    tile = _build_compact_tile(_tile_file_path(manifest, row, col))
+    _TILE_CACHE[key] = tile
+    while len(_TILE_CACHE) > TILE_CACHE_MAX:
+        _TILE_CACHE.popitem(last=False)
+    return tile
+
+
+def _candidate_cell_range(
+    lat: float, lng: float, radius_meters: int, cell_degrees: float
+) -> Tuple[int, int, int, int]:
+    """Midpoint-grid cell range a query reads (mirrors the lookup in
+    _extract_local_edges so tile selection covers its candidates)."""
+    lat_margin = radius_meters / 111320.0
+    lng_margin = radius_meters / (
+        111320.0 * max(0.1, math.cos(math.radians(lat)))
+    )
+    return (
+        math.floor((lat - lat_margin) / cell_degrees),
+        math.floor((lat + lat_margin) / cell_degrees),
+        math.floor((lng - lng_margin) / cell_degrees),
+        math.floor((lng + lng_margin) / cell_degrees),
+    )
+
+
+def _tiles_for_query(
+    manifest: Dict[str, Any], lat: float, lng: float, radius_meters: int
+) -> List[Tuple[int, int]]:
+    """Tiles intersecting the query's candidate-cell extent.
+
+    Candidate edges are bucketed by midpoint into grid cells; every
+    tile that contains any part of those cells must be loaded, or an
+    edge whose midpoint sits in a cell overhanging the search square
+    would be missed. Tiles are unions of whole degrees-fractions, so
+    this is the cell extent converted to tile indices, clamped to the
+    coverage grid and to tiles that actually hold data.
+    """
+    cell_degrees = float(manifest["grid_cell_degrees"])
+    tile_degrees = float(manifest["tile_degrees"])
+    south, west, _north, _east = (
+        float(v) for v in manifest["bbox"]
+    )
+    cx0, cx1, cy0, cy1 = _candidate_cell_range(
+        lat, lng, radius_meters, cell_degrees
+    )
+    ext_south = cx0 * cell_degrees
+    ext_north = (cx1 + 1) * cell_degrees
+    ext_west = cy0 * cell_degrees
+    ext_east = (cy1 + 1) * cell_degrees
+    rows_total = int(manifest["tile_rows"])
+    cols_total = int(manifest["tile_cols"])
+    r0 = max(0, math.floor((ext_south - south) / tile_degrees))
+    r1 = min(
+        rows_total - 1,
+        math.floor((ext_north - 1e-9 - south) / tile_degrees),
+    )
+    c0 = max(0, math.floor((ext_west - west) / tile_degrees))
+    c1 = min(
+        cols_total - 1,
+        math.floor((ext_east - 1e-9 - west) / tile_degrees),
+    )
+    available = manifest["tiles"]
+    return [
+        (row, col)
+        for row in range(r0, r1 + 1)
+        for col in range(c0, c1 + 1)
+        if f"{row}_{col}" in available
+    ]
+
+
+def _build_query_extract(
+    lat: float, lng: float, radius_meters: int
+) -> Dict[str, Any]:
+    """Merge the tiles under a query into a compact extract structure.
+
+    Returns exactly the dict shape _build_compact_extract produces,
+    scoped to the query: only edges whose midpoint falls in the
+    query's candidate grid cells are merged (the same candidate set
+    the whole-city midpoint grid would hand to _extract_local_edges),
+    deduped by global edge id, with nodes remapped by GLOBAL node id
+    so junction identity matches the whole-city loader exactly.
+    Raises if the extract cannot serve (missing/corrupt tile), so
+    callers fall through to the live path.
+    """
+    manifest = _load_extract_manifest()
+    if manifest is None:
+        raise RuntimeError("Offline OSM extract is not available")
+    scale = float(manifest["coordinate_scale"])
+    cell_degrees = float(manifest["grid_cell_degrees"])
+    cx0, cx1, cy0, cy1 = _candidate_cell_range(
+        lat, lng, radius_meters, cell_degrees
+    )
+    tiles_used = _tiles_for_query(manifest, lat, lng, radius_meters)
+
+    names: List[str] = []
+    name_map: Dict[str, int] = {}
+
+    def intern_name(text: str) -> int:
+        idx = name_map.get(text)
+        if idx is None:
+            idx = len(names)
+            name_map[text] = idx
+            names.append(text)
+        return idx
+
+    node_map: Dict[int, int] = {}
+    node_lat: array = array("i")
+    node_lng: array = array("i")
+
+    def remap_node(tile: Dict[str, Any], local_idx: int) -> int:
+        global_id = tile["node_ids"][local_idx]
+        merged = node_map.get(global_id)
+        if merged is None:
+            merged = len(node_lat)
+            node_map[global_id] = merged
+            node_lat.append(tile["node_lat"][local_idx])
+            node_lng.append(tile["node_lng"][local_idx])
+        return merged
+
+    # Collect candidate edges across tiles, deduped by global id,
+    # then merge in global-id order (deterministic shaping).
+    pending: List[Tuple[int, Dict[str, Any], int]] = []
+    seen_edges: set = set()
+    tile_objs: List[Dict[str, Any]] = []
+    for row, col in tiles_used:
+        tile = _load_tile(row, col)
+        tile_objs.append(tile)
+        for local_idx, global_id in enumerate(tile["edge_ids"]):
+            if global_id not in seen_edges:
+                seen_edges.add(global_id)
+                pending.append((int(global_id), tile, local_idx))
+    pending.sort(key=lambda item: item[0])
+
+    edge_offsets: array = array("i", [0])
+    edge_nodes: array = array("i")
+    edge_name: array = array("i")
+    edge_hw: array = array("b")
+    edge_sf: array = array("i")
+    edge_tun: array = array("i")
+    edge_loc: array = array("i")
+    sf_vocab = _Vocab()
+    tun_vocab = _Vocab()
+    loc_vocab = _Vocab()
+    grid_lists: Dict[int, List[int]] = {}
+    edge_index = 0
+    for _global_id, tile, local_idx in pending:
+        start = tile["edge_offsets"][local_idx]
+        end = tile["edge_offsets"][local_idx + 1]
+        local_seq = tile["edge_nodes"][start:end]
+        if len(local_seq) < 2:
+            continue
+        mid_local = local_seq[len(local_seq) // 2]
+        mid_lat = tile["node_lat"][mid_local] / scale
+        mid_lng = tile["node_lng"][mid_local] / scale
+        cell_x = math.floor(mid_lat / cell_degrees)
+        cell_y = math.floor(mid_lng / cell_degrees)
+        if not (cx0 <= cell_x <= cx1 and cy0 <= cell_y <= cy1):
+            continue
+        for local_node in local_seq:
+            edge_nodes.append(remap_node(tile, local_node))
+        edge_offsets.append(len(edge_nodes))
+        edge_name.append(
+            intern_name(tile["names"][tile["edge_name"][local_idx]])
+        )
+        edge_hw.append(tile["edge_hw"][local_idx])
+        edge_sf.append(
+            sf_vocab.intern(tile["sf_values"][tile["edge_sf"][local_idx]])
+        )
+        edge_tun.append(
+            tun_vocab.intern(
+                tile["tun_values"][tile["edge_tun"][local_idx]]
+            )
+        )
+        edge_loc.append(
+            loc_vocab.intern(
+                tile["loc_values"][tile["edge_loc"][local_idx]]
+            )
+        )
+        grid_lists.setdefault(_grid_key(cell_x, cell_y), []).append(
+            edge_index
+        )
+        edge_index += 1
+
+    # Waterways from the same tiles, deduped by global id, re-encoded
+    # against the merged node/name tables so
+    # _decode_extract_waterway works unchanged.
+    waterway_rows: Dict[int, List[Any]] = {}
+    for tile in tile_objs:
+        for global_id, local_seq, local_name_idx, ww_type in tile[
+            "waterways"
+        ]:
+            if global_id in waterway_rows:
+                continue
+            merged_seq = [
+                remap_node(tile, local_node) for local_node in local_seq
+            ]
+            if len(merged_seq) < 2:
+                continue
+            encoded = [merged_seq[0]]
+            for prev, cur in zip(merged_seq, merged_seq[1:]):
+                encoded.append(cur - prev)
+            waterway_rows[int(global_id)] = [
+                encoded,
+                intern_name(tile["names"][local_name_idx]),
+                ww_type,
+            ]
+    waterways = [waterway_rows[gid] for gid in sorted(waterway_rows)]
+
+    grid = {key: array("i", idxs) for key, idxs in grid_lists.items()}
+    return {
+        "metadata": manifest,
+        "names": names,
+        "waterways": waterways,
+        "node_lat": node_lat,
+        "node_lng": node_lng,
+        "edge_offsets": edge_offsets,
+        "edge_nodes": edge_nodes,
+        "edge_name": edge_name,
+        "edge_hw": edge_hw,
+        "edge_sf": edge_sf,
+        "sf_values": sf_vocab.values,
+        "edge_tun": edge_tun,
+        "tun_values": tun_vocab.values,
+        "edge_loc": edge_loc,
+        "loc_values": loc_vocab.values,
+        "grid": grid,
+        "edge_count_total": edge_index,
+    }
+
+
+def _query_extract_data(
+    lat: float, lng: float, radius_meters: int
+) -> Optional[Dict[str, Any]]:
+    """Compact extract data scoped to one query.
+
+    Default (tiled) path merges only the tiles under the query. The
+    legacy HYDROCAST_OSM_EXTRACT single-file override returns the
+    whole-city compact extract instead.
+    """
+    if os.getenv("HYDROCAST_OSM_EXTRACT"):
+        return _load_extract()
+    return _build_query_extract(lat, lng, radius_meters)
+
+
 def _extract_covers(lat: float, lng: float, radius_meters: int) -> bool:
     """True if the point AND its full search circle sit inside coverage."""
-    data = _load_extract()
-    if data is None:
-        return False
-    south, west, north, east = (float(v) for v in data["metadata"]["bbox"])
+    if os.getenv("HYDROCAST_OSM_EXTRACT"):
+        data = _load_extract()
+        if data is None:
+            return False
+        bbox = data["metadata"]["bbox"]
+    else:
+        manifest = _load_extract_manifest()
+        if manifest is None:
+            return False
+        bbox = manifest["bbox"]
+    south, west, north, east = (float(v) for v in bbox)
     lat_margin = radius_meters / 111320.0
     lng_margin = radius_meters / (
         111320.0 * max(0.1, math.cos(math.radians(lat)))
@@ -714,7 +1144,10 @@ def _decode_extract_waterway(data: Dict[str, Any], raw: Any) -> Dict[str, Any]:
 
 
 def _extract_local_edges(
-    lat: float, lng: float, radius_meters: int
+    lat: float,
+    lng: float,
+    radius_meters: int,
+    data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Any]:
     """Road edges near a point from the offline extract.
 
@@ -722,8 +1155,11 @@ def _extract_local_edges(
     the live path, plus a minimal graph object (``.nodes`` mapping
     node-index -> {"x": lng, "y": lat}) so ``_build_modelled_drainage``
     works unchanged. Raises if the extract cannot serve the point.
+    ``data`` is the query-scoped compact extract from
+    ``_query_extract_data``; built here when not supplied.
     """
-    data = _load_extract()
+    if data is None:
+        data = _query_extract_data(lat, lng, radius_meters)
     if data is None:
         raise RuntimeError("Offline OSM extract is not available")
 
@@ -820,13 +1256,20 @@ def _extract_local_edges(
 
 
 def _extract_local_waterways(
-    lat: float, lng: float, radius_meters: int
+    lat: float,
+    lng: float,
+    radius_meters: int,
+    data: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Real OSM waterways near a point, from the offline extract.
 
     Same conduit shape as ``_fetch_waterway_conduits``.
     """
-    data = _load_extract()
+    if data is None:
+        try:
+            data = _query_extract_data(lat, lng, radius_meters)
+        except Exception:  # noqa: BLE001 - waterways are best-effort
+            return []
     if data is None:
         return []
 
@@ -1396,11 +1839,16 @@ def fetch_roads_near_point(
     # Any failure here falls through to the live path below.
     if _extract_covers(float(lat), float(lng), int(radius_meters)):
         try:
-            local_edges, local_graph = _extract_local_edges(
+            query_data = _query_extract_data(
                 float(lat), float(lng), int(radius_meters)
             )
+            if query_data is None:
+                raise RuntimeError("Offline OSM extract is not available")
+            local_edges, local_graph = _extract_local_edges(
+                float(lat), float(lng), int(radius_meters), data=query_data
+            )
             local_waterways = _extract_local_waterways(
-                float(lat), float(lng), int(radius_meters)
+                float(lat), float(lng), int(radius_meters), data=query_data
             )
             local_result = _assemble_result(
                 local_graph,
@@ -1411,9 +1859,8 @@ def fetch_roads_near_point(
                 resolved_place,
                 local_waterways,
             )
-            extract = _load_extract()
             local_result["data_extract_date"] = str(
-                (extract or {}).get("metadata", {}).get("extract_date", "")
+                query_data.get("metadata", {}).get("extract_date", "")
             )
             _cache_put(cache_key, local_result)
             return local_result

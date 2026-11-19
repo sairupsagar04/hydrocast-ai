@@ -9,18 +9,33 @@ WHY THIS EXISTS
     HydroCast fell back to a 3-street synthetic layout and the flood
     router reported ``route_source="no_path"``. This script precomputes
     the roads and open waterways for the Hyderabad area ONCE, offline,
-    into compact JSON part files (``backend/data/hyderabad_osm.part*.json``
-    plus a ``backend/data/hyderabad_osm.manifest.json`` index). At
-    runtime ``osm_service`` serves any point inside the extract
-    coverage from those files - no network call - and only points
-    outside coverage use the live Overpass path.
+    into compact JSON tile files (``backend/data/tiles/*.json`` plus a
+    ``backend/data/hyderabad_osm.manifest.json`` index). At runtime
+    ``osm_service`` serves any point inside the extract coverage from
+    those files - no network call - and only points outside coverage
+    use the live Overpass path.
+
+WHY TILES (format 3)
+    Format 2 stored the whole city as one logical extract split into
+    ~4.5 MB part files, and the runtime had to parse and build compact
+    arrays for the ENTIRE city on first use (~143 MB peak, ~85 MB
+    retained) inside a ~512 MB free-tier instance that also runs the
+    DEM/raster stages - the first prediction still OOM-killed the
+    process. Format 3 therefore cuts the coverage into geographic
+    tiles (default 0.05 degrees, a 10x10 grid over the bbox). Each
+    tile file holds ONLY the road edges and waterways whose geometry
+    intersects that tile (an edge crossing a boundary appears in each
+    tile it touches; the runtime dedupes by global edge id). A query
+    loads and parses only the tiles under its search area - a 2 km
+    radius query touches at most 4 tiles geometrically - so the
+    extract's memory contribution drops to a few MB per query.
 
 REFRESH CADENCE
     The extract is a snapshot. Rebuild it monthly, or on demand when
     road coverage matters (new flyovers/ORR exits appear in OSM
     regularly). Rebuilding is: download a fresh source (below), run
-    this script, commit the regenerated part files and manifest, push.
-    The extract date is stored in the file metadata and surfaced by the
+    this script, commit the regenerated tile files and manifest, push.
+    The extract date is stored in the manifest and surfaced by the
     API as ``data_extract_date`` so staleness is always visible.
 
 DATA SOURCES (either works; the PBF route is what produced the
@@ -42,53 +57,60 @@ committed extract)
            python build_hyderabad_extract.py --source overpass \
                --output-dir ../data
 
-OUTPUT FORMAT (compact, spatial-indexed, format 2, split into parts)
-    The logical extract is one object:
+OUTPUT FORMAT (compact, geographic tiles, format 3)
+    A tiny manifest (``hyderabad_osm.manifest.json``) records the
+    format, extract date, bbox, source, attribution, license, the
+    shared vocabularies (``hw_values``), the tile grid
+    (``tile_degrees``, ``tile_rows``, ``tile_cols``, ``tile_dir``,
+    ``tile_file_template``) and a ``tiles`` index mapping
+    ``"<row>_<col>"`` to per-tile edge/waterway counts.
+
+    Each tile file (``tiles/hyd_r{row:02d}_c{col:02d}.json``) is one
+    JSON object in the format-2-style compact encoding, scoped to the
+    tile:
 
     {
-      "metadata": {dataset, extract_date, bbox [S, W, N, E], source,
-                   source_attribution, license, coordinate_scale,
-                   grid_cell_degrees, hw_values, counts...},
-      "names":     [str, ...]                       # interned name table
+      "tile":      [row, col],
+      "names":     [str, ...]        # interned name table (tile-local)
       "nodes":     [lat_e5, lng_e5, d_lat, d_lng, ...]
-                                                    # flat, delta-encoded
-                                                    # shared node table
-      "edges":     [[n_deltas, name_idx, hw_code, sf?, tun?, loc?], ...]
-                                                    # roads, pre-split at
-                                                    # junction nodes so
-                                                    # endpoints are real
-                                                    # intersections;
-                                                    # trailing tag fields
-                                                    # omitted when empty
-      "waterways": [[n_deltas, name_idx, waterway_type], ...]
+                                     # flat, delta-encoded coords of
+                                     # the tile's nodes, ordered by
+                                     # ascending global node id
+      "node_ids":  [id0, d_id, ...]  # delta-encoded GLOBAL node ids,
+                                     # parallel to "nodes"; lets the
+                                     # runtime keep exact global node
+                                     # identity when merging tiles
+      "edges":     [[id_delta, n_deltas, name_idx, hw_code,
+                     sf?, tun?, loc?], ...]
+                                     # roads pre-split at junction
+                                     # nodes; sorted by global edge
+                                     # id, id stored delta-encoded;
+                                     # n_deltas are TILE-LOCAL node
+                                     # indices; trailing tag fields
+                                     # omitted when empty
+      "waterways": [[id_delta, n_deltas, name_idx, waterway_type],
+                    ...]               # same id/sequence encoding
     }
 
-    On disk it is split into part files of at most ~4.5 MB each (the
-    GitHub transport used to commit this repo inlines file contents and
-    rejects larger request bodies). Each part is a JSON object holding
-    a subset of the top-level keys; list values are consecutive chunks
-    of the full arrays, split at item boundaries (``nodes`` at lat/lng
-    pair boundaries, since it is a flat delta chain). A tiny manifest
-    (``hyderabad_osm.manifest.json``) records the format, extract date,
-    bbox, source, attribution, license and the ordered part list; the
-    runtime merges parts by concatenation in manifest order, which
-    reproduces the logical extract exactly - every stored node/name
-    index reference stays valid.
+    Coordinates are integers scaled by 1e5 (~1.1 m resolution, the
+    same precision the flood router joins endpoints at). Node
+    coordinates and node-index sequences are delta-encoded, names are
+    interned per tile and highway classes are stored as small integer
+    codes into the manifest's shared ``hw_values`` table.
 
-    The spatial grid is NOT stored: the runtime rebuilds it in memory
-    at load from edge midpoints, using ``grid_cell_degrees``.
+    No spatial grid is baked into the tiles: the runtime rebuilds the
+    midpoint grid in memory per query from just the loaded tiles,
+    using ``grid_cell_degrees`` (0.02 degrees, ~2.2 km) from the
+    manifest metadata.
 
-    Coordinates are integers scaled by 1e5 (~1.1 m resolution, the same
-    precision the flood router joins endpoints at). Node coordinates
-    and node-index sequences are delta-encoded, names are interned and
-    highway classes are stored as small integer codes - together these
-    keep the whole Hyderabad file under ~20 MB. The grid buckets each
-    road edge by its midpoint into 0.02-degree cells (~2.2 km) so the
-    runtime lookup only materialises nearby edges.
+    Individual tile files stay small (largest ~0.7 MB at the default
+    0.05-degree grid), comfortably below the per-file size limit of
+    the GitHub transport used to commit this repo, which inlines file
+    contents and rejects larger request bodies.
 
 OpenStreetMap data is (c) OpenStreetMap contributors, available under
 the Open Database License (ODbL). The attribution is stored in the
-file metadata and must be kept if the data is republished.
+manifest and must be kept if the data is republished.
 """
 
 import argparse
@@ -108,6 +130,7 @@ DEFAULT_BBOX = (17.15, 78.15, 17.65, 78.65)
 
 COORD_SCALE = 100000  # 1e5 -> ~1.1 m
 GRID_CELL_DEGREES = 0.02
+DEFAULT_TILE_DEGREES = 0.05
 
 # Same highway set osm_service ranks (its HIGHWAY_RANK keys) plus "road".
 ROAD_HIGHWAYS = {
@@ -123,6 +146,12 @@ OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
 ]
 USER_AGENT = "HydroCastAI-extract-builder/1.0 (offline OSM extract)"
+
+MANIFEST_NAME = "hyderabad_osm.manifest.json"
+TILE_DIR_NAME = "tiles"
+TILE_NAME_TEMPLATE = "hyd_r{row:02d}_c{col:02d}.json"
+# Legacy format-2 artefacts removed by write_extract_tiles().
+LEGACY_SINGLE_NAME = "hyderabad_osm.json"
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +273,7 @@ def read_ways_from_overpass(
 
 
 # ---------------------------------------------------------------------------
-# Shared: split road ways at junctions, index nodes, build the grid
+# Shared: split road ways at junctions, index nodes globally
 # ---------------------------------------------------------------------------
 
 def _scale(lat: float, lng: float) -> Tuple[int, int]:
@@ -256,7 +285,15 @@ def build_extract(
     waterway_ways: List[Dict[str, Any]],
     bbox: Tuple[float, float, float, float],
     source_label: str,
+    extract_date: str,
 ) -> Dict[str, Any]:
+    """Build the decoded logical extract (global node/edge indexing).
+
+    Returns {"metadata", "nodes", "edges", "waterways"} where nodes
+    are [lat_e5, lng_e5] pairs, edges/waterways are dicts whose "n"
+    lists hold GLOBAL node indices (an item's position in the list is
+    its global id). ``build_tiles`` cuts this into format-3 tiles.
+    """
     # Count how many road ways use each (scaled) node coordinate: nodes
     # used by 2+ ways are junctions, and ways are split there so edge
     # endpoints are real intersections (the flood router joins edges by
@@ -318,16 +355,11 @@ def build_extract(
             }
         )
 
-    # Note: no spatial grid is baked into the file. osm_service builds
-    # the grid index in memory at load time from edge midpoints (see
-    # GRID_CELL_DEGREES in the metadata) - baking it in cost ~3 MB of
-    # JSON for something that takes a fraction of a second to rebuild.
-
     south, west, north, east = bbox
     metadata = {
         "dataset": "HydroCast Hyderabad offline OpenStreetMap extract",
-        "format": 2,
-        "extract_date": date.today().isoformat(),
+        "format": 3,
+        "extract_date": extract_date,
         "bbox": [south, west, north, east],
         "source": source_label,
         "source_attribution": "(c) OpenStreetMap contributors",
@@ -338,9 +370,19 @@ def build_extract(
         "waterway_count": len(waterways),
         "edge_count": len(edges),
         "node_count": len(nodes),
+        "hw_values": sorted({edge["hw"] for edge in edges}),
     }
-    return _encode_extract(metadata, nodes, edges, waterways)
+    return {
+        "metadata": metadata,
+        "nodes": nodes,
+        "edges": edges,
+        "waterways": waterways,
+    }
 
+
+# ---------------------------------------------------------------------------
+# Format 3: geographic tiles
+# ---------------------------------------------------------------------------
 
 def _delta_encode(sequence: Sequence[int]) -> List[int]:
     encoded = [sequence[0]]
@@ -349,204 +391,221 @@ def _delta_encode(sequence: Sequence[int]) -> List[int]:
     return encoded
 
 
-def _encode_extract(
-    metadata: Dict[str, Any],
-    nodes: List[List[int]],
-    edges: List[Dict[str, Any]],
-    waterways: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Encode the extract into the compact format-2 on-disk shape."""
-    names: List[str] = []
-    name_index: Dict[str, int] = {}
-
-    def intern(name: str) -> int:
-        idx = name_index.get(name)
-        if idx is None:
-            idx = len(names)
-            name_index[name] = idx
-            names.append(name)
-        return idx
-
-    hw_values = sorted({edge["hw"] for edge in edges})
-    hw_code = {value: idx for idx, value in enumerate(hw_values)}
-    metadata["hw_values"] = hw_values
-
-    flat_nodes: List[int] = []
-    prev_lat = prev_lng = 0
-    for lat, lng in nodes:
-        flat_nodes.append(lat - prev_lat)
-        flat_nodes.append(lng - prev_lng)
-        prev_lat, prev_lng = lat, lng
-
-    encoded_edges: List[List[Any]] = []
-    for edge in edges:
-        row: List[Any] = [
-            _delta_encode(edge["n"]),
-            intern(edge["name"]),
-            hw_code[edge["hw"]],
-        ]
-        tail = [edge.get("sf", ""), edge.get("tun", ""), edge.get("loc", "")]
-        while tail and tail[-1] == "":
-            tail.pop()
-        row.extend(tail)
-        encoded_edges.append(row)
-
-    encoded_waterways: List[List[Any]] = [
-        [_delta_encode(way["n"]), intern(way["name"]), way["ww"]]
-        for way in waterways
-    ]
-
-    return {
-        "metadata": metadata,
-        "names": names,
-        "nodes": flat_nodes,
-        "edges": encoded_edges,
-        "waterways": encoded_waterways,
-    }
+def _tiles_for_bbox(
+    item_bbox: Tuple[float, float, float, float],
+    origin_south: float,
+    origin_west: float,
+    tile_degrees: float,
+    tile_rows: int,
+    tile_cols: int,
+) -> List[Tuple[int, int]]:
+    """All tile (row, col) whose area intersects the item's bbox."""
+    s, w, n, e = item_bbox
+    r0 = max(0, int(math.floor((s - origin_south) / tile_degrees)))
+    r1 = min(tile_rows - 1, int(math.floor((n - origin_south) / tile_degrees)))
+    c0 = max(0, int(math.floor((w - origin_west) / tile_degrees)))
+    c1 = min(tile_cols - 1, int(math.floor((e - origin_west) / tile_degrees)))
+    return [(r, c) for r in range(r0, r1 + 1) for c in range(c0, c1 + 1)]
 
 
-# ---------------------------------------------------------------------------
-# Output: split part files + manifest (see OUTPUT FORMAT in the docstring)
-# ---------------------------------------------------------------------------
+def build_tiles(
+    extract: Dict[str, Any], tile_degrees: float = DEFAULT_TILE_DEGREES
+) -> Tuple[Dict[str, Any], Dict[Tuple[int, int], Dict[str, Any]]]:
+    """Cut a decoded extract into format-3 tiles + a manifest dict.
 
-MAX_PART_BYTES = 4_500_000
-PART_NAME_TEMPLATE = "hyderabad_osm.part{index}.json"
-MANIFEST_NAME = "hyderabad_osm.manifest.json"
-SECTION_ORDER = ("metadata", "names", "nodes", "edges", "waterways")
-
-
-def _dump(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-
-
-def split_extract_parts(
-    extract: Dict[str, Any], max_part_bytes: int = MAX_PART_BYTES
-) -> List[Dict[str, Any]]:
-    """Split an encoded extract into part dicts of <= max_part_bytes each.
-
-    Each part is a JSON object holding a subset of the extract's
-    top-level keys; list values are consecutive chunks of the full
-    arrays. Concatenating the chunks in part order reproduces the
-    original arrays exactly.
+    Every edge/waterway is assigned to each tile its geometry bbox
+    intersects. Within a tile, items are sorted by global id (stored
+    delta-encoded), nodes are the union of the items' nodes ordered
+    by global id (coords and global ids both delta-encoded), and
+    names are interned tile-locally. Highway codes index the shared
+    ``hw_values`` table kept in the manifest metadata.
     """
-    parts: List[Dict[str, Any]] = []
-    current: Dict[str, Any] = {}
-    current_size = 2  # "{}"
-
-    def flush() -> None:
-        nonlocal current, current_size
-        if current:
-            parts.append(current)
-        current = {}
-        current_size = 2
-
-    def key_cost(key: str, first_key: bool) -> int:
-        # '"key":' plus the comma separating it from the previous key.
-        return len(key) + 3 + (0 if first_key else 1)
-
-    for key in SECTION_ORDER:
-        value = extract[key]
-        if isinstance(value, dict):
-            blob_size = len(_dump(value).encode("utf-8"))
-            cost = key_cost(key, not current) + blob_size
-            if current and current_size + cost > max_part_bytes:
-                flush()
-                cost = key_cost(key, True) + blob_size
-            current[key] = value
-            current_size += cost
-            continue
-        items = list(value)
-        item_sizes = [
-            len(_dump(item).encode("utf-8")) for item in items
-        ]
-        index = 0
-        while index < len(items):
-            if key not in current:
-                cost = key_cost(key, not current) + 2  # "[]"
-                if current and current_size + cost > max_part_bytes:
-                    flush()
-                    cost = key_cost(key, True) + 2
-                current[key] = []
-                current_size += cost
-            budget = max_part_bytes - current_size
-            taken = 0
-            used = 0
-            while index + taken < len(items):
-                extra = item_sizes[index + taken] + (
-                    1 if (current[key] or taken) else 0
-                )
-                if used + extra > budget and (current[key] or taken):
-                    break
-                used += extra
-                taken += 1
-            if taken == 0:
-                if current:
-                    flush()
-                    continue
-                # A single item larger than a whole part: take it anyway
-                # (cannot happen for this format - items are tiny).
-                taken = 1
-                used = item_sizes[index]
-            if key == "nodes" and index + taken < len(items) and taken % 2 == 1:
-                # Keep lat/lng pairs together across part boundaries.
-                taken -= 1
-                used = sum(item_sizes[index : index + taken]) + max(0, taken - 1)
-            current[key].extend(items[index : index + taken])
-            current_size += used
-            index += taken
-            if index < len(items):
-                flush()
-    flush()
-    return parts
-
-
-def write_extract_parts(
-    extract: Dict[str, Any],
-    output_dir: str,
-    max_part_bytes: int = MAX_PART_BYTES,
-) -> List[str]:
-    """Write the extract as split part files + manifest into output_dir.
-
-    Returns the ordered part file names. Stale part files from a
-    previous build with more parts are removed so the directory always
-    matches the manifest.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    parts = split_extract_parts(extract, max_part_bytes)
-    part_names: List[str] = []
-    for i, part in enumerate(parts, start=1):
-        name = PART_NAME_TEMPLATE.format(index=i)
-        payload = _dump(part).encode("utf-8")
-        if len(payload) > max_part_bytes:
-            raise ValueError(
-                f"Part {name} is {len(payload)} bytes > {max_part_bytes}"
-            )
-        with open(os.path.join(output_dir, name), "wb") as handle:
-            handle.write(payload)
-        part_names.append(name)
-    # Remove stale parts (e.g. part5 from an older, larger build).
-    stale_index = len(parts) + 1
-    while os.path.exists(
-        os.path.join(output_dir, PART_NAME_TEMPLATE.format(index=stale_index))
-    ):
-        os.remove(
-            os.path.join(output_dir, PART_NAME_TEMPLATE.format(index=stale_index))
-        )
-        stale_index += 1
     metadata = extract["metadata"]
+    nodes = extract["nodes"]
+    edges = extract["edges"]
+    waterways = extract["waterways"]
+    south, west, north, east = (float(v) for v in metadata["bbox"])
+    tile_rows = int(math.ceil((north - south) / tile_degrees - 1e-9))
+    tile_cols = int(math.ceil((east - west) / tile_degrees - 1e-9))
+    scale = float(metadata["coordinate_scale"])
+    hw_code = {value: idx for idx, value in enumerate(metadata["hw_values"])}
+
+    def item_bbox(item: Dict[str, Any]) -> Tuple[float, float, float, float]:
+        lats = [nodes[i][0] for i in item["n"]]
+        lngs = [nodes[i][1] for i in item["n"]]
+        return (
+            min(lats) / scale,
+            min(lngs) / scale,
+            max(lats) / scale,
+            max(lngs) / scale,
+        )
+
+    tile_edges: Dict[Tuple[int, int], List[int]] = {}
+    tile_waterways: Dict[Tuple[int, int], List[int]] = {}
+    for global_id, edge in enumerate(edges):
+        for tile in _tiles_for_bbox(
+            item_bbox(edge), south, west, tile_degrees, tile_rows, tile_cols
+        ):
+            tile_edges.setdefault(tile, []).append(global_id)
+    for global_id, way in enumerate(waterways):
+        for tile in _tiles_for_bbox(
+            item_bbox(way), south, west, tile_degrees, tile_rows, tile_cols
+        ):
+            tile_waterways.setdefault(tile, []).append(global_id)
+
+    tiles: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    tile_index: Dict[str, Dict[str, int]] = {}
+    for tile in sorted(set(tile_edges) | set(tile_waterways)):
+        edge_ids = sorted(tile_edges.get(tile, []))
+        way_ids = sorted(tile_waterways.get(tile, []))
+
+        node_set = set()
+        for gid in edge_ids:
+            node_set.update(edges[gid]["n"])
+        for gid in way_ids:
+            node_set.update(waterways[gid]["n"])
+        ordered_nodes = sorted(node_set)
+        local_index = {gid: pos for pos, gid in enumerate(ordered_nodes)}
+
+        flat_nodes: List[int] = []
+        prev_lat = prev_lng = 0
+        for gid in ordered_nodes:
+            lat_i, lng_i = nodes[gid]
+            flat_nodes.append(lat_i - prev_lat)
+            flat_nodes.append(lng_i - prev_lng)
+            prev_lat, prev_lng = lat_i, lng_i
+
+        names: List[str] = []
+        name_index: Dict[str, int] = {}
+
+        def intern(name: str) -> int:
+            idx = name_index.get(name)
+            if idx is None:
+                idx = len(names)
+                name_index[name] = idx
+                names.append(name)
+            return idx
+
+        encoded_edges: List[List[Any]] = []
+        prev_gid = 0
+        for gid in edge_ids:
+            edge = edges[gid]
+            row: List[Any] = [
+                gid - prev_gid,
+                _delta_encode([local_index[i] for i in edge["n"]]),
+                intern(edge["name"]),
+                hw_code[edge["hw"]],
+            ]
+            prev_gid = gid
+            tail = [edge.get("sf", ""), edge.get("tun", ""), edge.get("loc", "")]
+            while tail and tail[-1] == "":
+                tail.pop()
+            row.extend(tail)
+            encoded_edges.append(row)
+
+        encoded_waterways: List[List[Any]] = []
+        prev_gid = 0
+        for gid in way_ids:
+            way = waterways[gid]
+            encoded_waterways.append(
+                [
+                    gid - prev_gid,
+                    _delta_encode([local_index[i] for i in way["n"]]),
+                    intern(way["name"]),
+                    way["ww"],
+                ]
+            )
+            prev_gid = gid
+
+        tiles[tile] = {
+            "tile": [tile[0], tile[1]],
+            "names": names,
+            "nodes": flat_nodes,
+            "node_ids": _delta_encode(ordered_nodes),
+            "edges": encoded_edges,
+            "waterways": encoded_waterways,
+        }
+        tile_index[f"{tile[0]}_{tile[1]}"] = {
+            "edges": len(edge_ids),
+            "waterways": len(way_ids),
+            "nodes": len(ordered_nodes),
+        }
+
     manifest = {
         "dataset": metadata["dataset"],
-        "format": metadata["format"],
+        "format": 3,
         "extract_date": metadata["extract_date"],
         "bbox": metadata["bbox"],
         "source": metadata["source"],
         "source_attribution": metadata["source_attribution"],
         "license": metadata["license"],
-        "parts": part_names,
+        "coordinate_scale": metadata["coordinate_scale"],
+        "grid_cell_degrees": metadata["grid_cell_degrees"],
+        "hw_values": metadata["hw_values"],
+        "road_way_count": metadata["road_way_count"],
+        "waterway_count": metadata["waterway_count"],
+        "edge_count": metadata["edge_count"],
+        "node_count": metadata["node_count"],
+        "tile_degrees": tile_degrees,
+        "tile_rows": tile_rows,
+        "tile_cols": tile_cols,
+        "tile_dir": TILE_DIR_NAME,
+        "tile_file_template": TILE_NAME_TEMPLATE,
+        "tiles": tile_index,
     }
+    return manifest, tiles
+
+
+# ---------------------------------------------------------------------------
+# Output: tile files + manifest (see OUTPUT FORMAT in the docstring)
+# ---------------------------------------------------------------------------
+
+def _dump(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def write_extract_tiles(
+    extract: Dict[str, Any],
+    output_dir: str,
+    tile_degrees: float = DEFAULT_TILE_DEGREES,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Write format-3 tile files + manifest into output_dir.
+
+    Returns (manifest, tile file names written). Stale tile files,
+    legacy format-2 part files and a legacy single-file extract in
+    the same directory are removed so the directory always matches
+    the manifest.
+    """
+    manifest, tiles = build_tiles(extract, tile_degrees)
+    os.makedirs(output_dir, exist_ok=True)
+    tile_dir = os.path.join(output_dir, TILE_DIR_NAME)
+    os.makedirs(tile_dir, exist_ok=True)
+
+    written: List[str] = []
+    for (row, col), tile in sorted(tiles.items()):
+        name = TILE_NAME_TEMPLATE.format(row=row, col=col)
+        payload = _dump(tile).encode("utf-8")
+        with open(os.path.join(tile_dir, name), "wb") as handle:
+            handle.write(payload)
+        written.append(name)
+        manifest["tiles"][f"{row}_{col}"]["bytes"] = len(payload)
+
+    # Remove stale tile files from previous builds.
+    keep = set(written)
+    for name in os.listdir(tile_dir):
+        if name.endswith(".json") and name not in keep:
+            os.remove(os.path.join(tile_dir, name))
+    # Remove legacy format-2 artefacts (part files, single file).
+    for name in os.listdir(output_dir):
+        if name.startswith("hyderabad_osm.part") and name.endswith(".json"):
+            os.remove(os.path.join(output_dir, name))
+    single = os.path.join(output_dir, LEGACY_SINGLE_NAME)
+    if os.path.exists(single):
+        os.remove(single)
+
     with open(os.path.join(output_dir, MANIFEST_NAME), "wb") as handle:
         handle.write(_dump(manifest).encode("utf-8"))
-    return part_names
+    return manifest, written
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -558,7 +617,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "data"
         ),
-        help="Directory for the part files + manifest (default: ../data)",
+        help="Directory for the tile files + manifest (default: ../data)",
     )
     parser.add_argument(
         "--bbox",
@@ -566,6 +625,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         metavar=("SOUTH", "WEST", "NORTH", "EAST"),
         default=list(DEFAULT_BBOX),
+    )
+    parser.add_argument(
+        "--tile-degrees",
+        type=float,
+        default=DEFAULT_TILE_DEGREES,
+        help="Geographic tile size in degrees (default: 0.05)",
+    )
+    parser.add_argument(
+        "--extract-date",
+        default=None,
+        help="Snapshot date stored in the manifest (default: today). "
+        "Pass the source file's date when re-cutting an older snapshot.",
     )
     args = parser.parse_args(argv)
 
@@ -584,20 +655,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         roads, waterways = read_ways_from_overpass(bbox)
         source_label = "OpenStreetMap via Overpass API, tiled over the Hyderabad bbox"
 
+    extract_date = args.extract_date or date.today().isoformat()
     print(f"[..] {len(roads)} road ways, {len(waterways)} waterways; building extract")
-    extract = build_extract(roads, waterways, bbox, source_label)
+    extract = build_extract(roads, waterways, bbox, source_label, extract_date)
 
     output_dir = os.path.abspath(args.output_dir)
-    part_names = write_extract_parts(extract, output_dir)
+    manifest, tile_names = write_extract_tiles(
+        extract, output_dir, tile_degrees=args.tile_degrees
+    )
+    tile_dir = os.path.join(output_dir, TILE_DIR_NAME)
     total_bytes = sum(
-        os.path.getsize(os.path.join(output_dir, name)) for name in part_names
+        os.path.getsize(os.path.join(tile_dir, name)) for name in tile_names
+    )
+    largest = max(
+        os.path.getsize(os.path.join(tile_dir, name)) for name in tile_names
     )
     print(
-        f"[ok] Wrote {len(part_names)} part files + {MANIFEST_NAME} to "
-        f"{output_dir} ({total_bytes / 1e6:.1f} MB total): "
-        f"{extract['metadata']['edge_count']} edges, "
-        f"{extract['metadata']['node_count']} nodes, "
-        f"{extract['metadata']['waterway_count']} waterways"
+        f"[ok] Wrote {len(tile_names)} tile files + {MANIFEST_NAME} to "
+        f"{output_dir} ({total_bytes / 1e6:.1f} MB total, largest tile "
+        f"{largest / 1e6:.2f} MB, grid {manifest['tile_rows']}x"
+        f"{manifest['tile_cols']}): {manifest['edge_count']} edges, "
+        f"{manifest['node_count']} nodes, "
+        f"{manifest['waterway_count']} waterways, "
+        f"extract date {manifest['extract_date']}"
     )
     return 0
 
