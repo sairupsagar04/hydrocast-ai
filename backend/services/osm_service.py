@@ -135,13 +135,15 @@ maps built from this data.
 """
 
 import copy
+import gc
 import gzip
 import json
 import math
 import os
 import time
+from array import array
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 __all__ = ["fetch_roads_near_point", "get_fast_fallback"]
 
@@ -433,37 +435,186 @@ def _read_extract_json(path: str) -> Any:
         return json.load(handle)
 
 
-def _load_extract_data() -> "tuple[Dict[str, Any], str]":
-    """Read the offline extract from disk, merging split part files.
+def _iter_extract_parts() -> Iterator[Dict[str, Any]]:
+    """Yield the extract's parsed JSON parts in storage order.
 
     The committed extract is split into <= ~4.5 MB part files listed in
     a manifest (the GitHub transport used for this repo rejects larger
     single files). Each part holds consecutive chunks of the top-level
-    arrays, so merging is plain concatenation in manifest order and
-    every stored node/name index reference stays valid. A single-file
-    extract (HYDROCAST_OSM_EXTRACT) is still honoured when set.
-    Returns (data, source_description).
+    arrays, so consuming them in manifest order keeps every stored
+    node/name index reference valid. A single-file extract
+    (HYDROCAST_OSM_EXTRACT) is still honoured when set.
     """
     if not os.getenv("HYDROCAST_OSM_EXTRACT") and os.path.exists(
         EXTRACT_MANIFEST_PATH
     ):
         manifest = _read_extract_json(EXTRACT_MANIFEST_PATH)
         base_dir = os.path.dirname(os.path.abspath(EXTRACT_MANIFEST_PATH))
-        merged: Dict[str, Any] = {}
         for part_name in manifest["parts"]:
-            part = _read_extract_json(os.path.join(base_dir, str(part_name)))
-            for key, value in part.items():
-                if isinstance(value, list) and isinstance(
-                    merged.get(key), list
-                ):
-                    merged[key].extend(value)
-                else:
-                    merged[key] = value
-        return merged, (
-            f"{EXTRACT_MANIFEST_PATH} "
-            f"({len(manifest['parts'])} part files)"
-        )
-    return _read_extract_json(EXTRACT_PATH), EXTRACT_PATH
+            yield _read_extract_json(
+                os.path.join(base_dir, str(part_name))
+            )
+        return
+    yield _read_extract_json(EXTRACT_PATH)
+
+
+class _Vocab:
+    """Intern short repeated tag strings (surface/tunnel/location)."""
+
+    def __init__(self) -> None:
+        self.values: List[str] = []
+        self._index: Dict[str, int] = {}
+
+    def intern(self, value: Any) -> int:
+        text = str(value or "")
+        idx = self._index.get(text)
+        if idx is None:
+            idx = len(self.values)
+            self.values.append(text)
+            self._index[text] = idx
+        return idx
+
+
+def _grid_key(cell_x: int, cell_y: int) -> int:
+    """Integer grid-cell key (cell_y is < 100000 for any real lng)."""
+    return cell_x * 100000 + cell_y
+
+
+def _build_compact_extract() -> Dict[str, Any]:
+    """Parse the extract and convert it to compact flat arrays.
+
+    MEMORY (why this looks the way it does): the parsed JSON object
+    graph for the whole city is ~170 MB of Python objects (471k edge
+    rows as nested lists, 1.6M int objects). The first loader kept
+    that graph AND a decoded list-of-[lat, lng]-lists node table,
+    peaking at ~310 MB for the extract alone - which OOM-killed the
+    512 MB production instance on its first prediction. So here each
+    part is converted into flat ``array`` tables as soon as it is
+    parsed and the parsed chunk is released before the next part is
+    read: node coordinates become two array('i') columns, edge node
+    sequences one concatenated array('i') plus an offsets table, tag
+    strings become vocab indices, and the midpoint grid maps integer
+    cell keys to array('i') edge lists. Retained footprint is ~25 MB;
+    the per-query code resolves only the edges in the query's cells.
+    """
+    metadata: Optional[Dict[str, Any]] = None
+    names: List[str] = []
+    waterways: List[Any] = []
+    node_lat: array = array("i")
+    node_lng: array = array("i")
+    edge_offsets: array = array("i", [0])
+    edge_nodes: array = array("i")
+    edge_name: array = array("i")
+    edge_hw: array = array("b")
+    edge_sf: array = array("i")
+    edge_tun: array = array("i")
+    edge_loc: array = array("i")
+    sf_vocab = _Vocab()
+    tun_vocab = _Vocab()
+    loc_vocab = _Vocab()
+    grid_lists: Dict[int, List[int]] = {}
+    run_lat = 0
+    run_lng = 0
+    edge_index = 0
+    seen_nodes = False
+    seen_edges = False
+
+    for part in _iter_extract_parts():
+        if "metadata" in part:
+            metadata = part["metadata"]
+        if "names" in part:
+            names = part["names"]
+        if "waterways" in part:
+            waterways = part["waterways"]
+        flat = part.get("nodes")
+        if flat:
+            seen_nodes = True
+            # The flat table is interleaved [dlat, dlng, ...] deltas;
+            # the running sums carry across part boundaries because
+            # parts hold consecutive chunks of the one table.
+            for i in range(0, len(flat) - 1, 2):
+                run_lat += int(flat[i])
+                run_lng += int(flat[i + 1])
+                node_lat.append(run_lat)
+                node_lng.append(run_lng)
+        raw_edges = part.get("edges")
+        if raw_edges:
+            seen_edges = True
+            if metadata is None:
+                raise ValueError("extract edges precede metadata")
+            coord_scale = float(metadata["coordinate_scale"])
+            cell_degrees = float(metadata["grid_cell_degrees"])
+            for raw in raw_edges:
+                sequence = raw[0]
+                node_idx = int(sequence[0])
+                edge_nodes.append(node_idx)
+                midpoint_pos = len(sequence) // 2
+                midpoint_idx = node_idx
+                for pos in range(1, len(sequence)):
+                    node_idx += int(sequence[pos])
+                    edge_nodes.append(node_idx)
+                    if pos == midpoint_pos:
+                        midpoint_idx = node_idx
+                edge_offsets.append(len(edge_nodes))
+                edge_name.append(int(raw[1]))
+                edge_hw.append(int(raw[2]))
+                edge_sf.append(
+                    sf_vocab.intern(raw[3] if len(raw) > 3 else "")
+                )
+                edge_tun.append(
+                    tun_vocab.intern(raw[4] if len(raw) > 4 else "")
+                )
+                edge_loc.append(
+                    loc_vocab.intern(raw[5] if len(raw) > 5 else "")
+                )
+                # Bucket the edge by its midpoint, as the file's
+                # grid_cell_degrees intends (the grid is deliberately
+                # not stored in the file; rebuilding it costs a
+                # fraction of a second and saves ~3 MB of JSON).
+                mid_lat = node_lat[midpoint_idx] / coord_scale
+                mid_lng = node_lng[midpoint_idx] / coord_scale
+                key = _grid_key(
+                    math.floor(mid_lat / cell_degrees),
+                    math.floor(mid_lng / cell_degrees),
+                )
+                grid_lists.setdefault(key, []).append(edge_index)
+                edge_index += 1
+        # Release this part's parsed object graph before reading the
+        # next one, so load-time peak stays near one part + arrays.
+        del part
+
+    if metadata is None or not seen_nodes or not seen_edges or not names:
+        raise ValueError("extract is missing required sections")
+    # Touch the required metadata keys so a truncated/foreign file
+    # fails here rather than at query time.
+    _ = (
+        metadata["bbox"],
+        metadata["coordinate_scale"],
+        metadata["grid_cell_degrees"],
+        metadata["hw_values"],
+    )
+    grid = {key: array("i", idxs) for key, idxs in grid_lists.items()}
+    del grid_lists
+    gc.collect()
+    return {
+        "metadata": metadata,
+        "names": names,
+        "waterways": waterways,
+        "node_lat": node_lat,
+        "node_lng": node_lng,
+        "edge_offsets": edge_offsets,
+        "edge_nodes": edge_nodes,
+        "edge_name": edge_name,
+        "edge_hw": edge_hw,
+        "edge_sf": edge_sf,
+        "sf_values": sf_vocab.values,
+        "edge_tun": edge_tun,
+        "tun_values": tun_vocab.values,
+        "edge_loc": edge_loc,
+        "loc_values": loc_vocab.values,
+        "grid": grid,
+        "edge_count_total": edge_index,
+    }
 
 
 def _load_extract() -> Optional[Dict[str, Any]]:
@@ -477,57 +628,20 @@ def _load_extract() -> Optional[Dict[str, Any]]:
         return _EXTRACT
     _EXTRACT_LOAD_ATTEMPTED = True
     try:
-        data, extract_source = _load_extract_data()
+        data = _build_compact_extract()
         metadata = data["metadata"]
-        # Touch the required keys so a truncated/foreign file fails here.
-        _ = (
-            metadata["bbox"],
-            metadata["coordinate_scale"],
-            metadata["grid_cell_degrees"],
-            metadata["hw_values"],
-            data["names"],
-            data["nodes"],
-            data["edges"],
-            data["waterways"],
-        )
-        # Decode the flat delta-encoded node table once, here, so the
-        # per-query lookups stay simple indexing.
-        flat = data["nodes"]
-        decoded_nodes: List[List[int]] = []
-        _lat = _lng = 0
-        for i in range(0, len(flat) - 1, 2):
-            _lat += int(flat[i])
-            _lng += int(flat[i + 1])
-            decoded_nodes.append([_lat, _lng])
-        data["_nodes_decoded"] = decoded_nodes
-        # Build the spatial grid in memory (it is deliberately not
-        # stored in the file - rebuilding it here costs a fraction of
-        # a second and saves ~3 MB of JSON). Each edge is bucketed by
-        # its midpoint into grid_cell_degrees cells; the midpoint node
-        # index is recovered by decoding only the first half of the
-        # edge's delta-encoded node sequence.
-        cell_degrees = float(metadata["grid_cell_degrees"])
-        coord_scale = float(metadata["coordinate_scale"])
-        grid: Dict[str, List[int]] = {}
-        for edge_index, raw_edge in enumerate(data["edges"]):
-            sequence = raw_edge[0]
-            midpoint_pos = len(sequence) // 2
-            node_index = int(sequence[0])
-            for delta in sequence[1 : midpoint_pos + 1]:
-                node_index += int(delta)
-            mid_lat = decoded_nodes[node_index][0] / coord_scale
-            mid_lng = decoded_nodes[node_index][1] / coord_scale
-            cell_key = (
-                f"{math.floor(mid_lat / cell_degrees)}:"
-                f"{math.floor(mid_lng / cell_degrees)}"
+        if os.getenv("HYDROCAST_OSM_EXTRACT"):
+            extract_source = EXTRACT_PATH
+        else:
+            extract_source = (
+                f"{EXTRACT_MANIFEST_PATH} (split part files)"
             )
-            grid.setdefault(cell_key, []).append(edge_index)
-        data["grid"] = grid
         _EXTRACT = data
         print(
             f"[i] Offline OSM extract loaded: {extract_source} "
-            f"({metadata.get('edge_count', len(data['edges']))} edges, "
-            f"extract date {metadata.get('extract_date', 'unknown')})."
+            f"({metadata.get('edge_count', data['edge_count_total'])} "
+            f"edges, extract date "
+            f"{metadata.get('extract_date', 'unknown')})."
         )
     except Exception as error:  # noqa: BLE001 - fall through to live path
         print(
@@ -559,9 +673,11 @@ def _extract_coords(
 ) -> List[List[float]]:
     """Materialise [[lat, lng], ...] for a stored node-index sequence."""
     scale = float(data["metadata"]["coordinate_scale"])
-    nodes = data["_nodes_decoded"]
+    node_lat = data["node_lat"]
+    node_lng = data["node_lng"]
     return [
-        [nodes[idx][0] / scale, nodes[idx][1] / scale] for idx in node_indices
+        [node_lat[idx] / scale, node_lng[idx] / scale]
+        for idx in node_indices
     ]
 
 
@@ -572,15 +688,19 @@ def _delta_decode(sequence: Sequence[int]) -> List[int]:
     return decoded
 
 
-def _decode_extract_edge(data: Dict[str, Any], raw: Any) -> Dict[str, Any]:
-    """Decode one format-2 edge row into the builder's dict shape."""
+def _decode_extract_edge(
+    data: Dict[str, Any], edge_index: int
+) -> Dict[str, Any]:
+    """Decode one format-2 edge, by index, into the builder's dict shape."""
+    start = data["edge_offsets"][edge_index]
+    end = data["edge_offsets"][edge_index + 1]
     return {
-        "n": _delta_decode(raw[0]),
-        "name": data["names"][int(raw[1])],
-        "hw": data["metadata"]["hw_values"][int(raw[2])],
-        "sf": raw[3] if len(raw) > 3 else "",
-        "tun": raw[4] if len(raw) > 4 else "",
-        "loc": raw[5] if len(raw) > 5 else "",
+        "n": list(data["edge_nodes"][start:end]),
+        "name": data["names"][data["edge_name"][edge_index]],
+        "hw": data["metadata"]["hw_values"][data["edge_hw"][edge_index]],
+        "sf": data["sf_values"][data["edge_sf"][edge_index]],
+        "tun": data["tun_values"][data["edge_tun"][edge_index]],
+        "loc": data["loc_values"][data["edge_loc"][edge_index]],
     }
 
 
@@ -625,13 +745,15 @@ def _extract_local_edges(
     grid = data["grid"]
     for cell_x in cell_x_range:
         for cell_y in cell_y_range:
-            candidate_indices.update(grid.get(f"{cell_x}:{cell_y}", []))
+            candidate_indices.update(
+                grid.get(_grid_key(cell_x, cell_y), ())
+            )
 
     edges: List[Dict[str, Any]] = []
     node_positions: Dict[Any, Dict[str, float]] = {}
     seen: set = set()
     for index in candidate_indices:
-        raw = _decode_extract_edge(data, data["edges"][index])
+        raw = _decode_extract_edge(data, index)
         node_seq = raw["n"]
         if len(node_seq) < 2:
             continue
